@@ -58,6 +58,7 @@
 #include <android/log.h>
 #include <android/trace.h>
 #include <algorithm>
+#include <random>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -557,6 +558,66 @@ void main() {
 }
 )";
 
+// Text box: one textured quad per box. Kotlin lays the text out
+// (StaticLayout) and rasterizes an 8-bit coverage bitmap at roughly the
+// current view scale; native keeps it as an R8 texture keyed by the
+// box's id (g_textTextures) and draws it here tinted by the box colour.
+// The quad's origin is the box's rotated top-left; uAxisX/uAxisY are
+// the rotated (w, 0) / (0, h) edges in doc px, so uv == local box
+// coords. Premultiplied output like every other compositor program.
+const char* kTextVS = R"(#version 300 es
+layout(location = 0) in vec2 aQuad;
+out vec2 vUv;
+out vec2 vDocPos;
+uniform mat4 uTransform;
+uniform vec2 uScreen;
+uniform vec2 uOrigin;
+uniform vec2 uAxisX;
+uniform vec2 uAxisY;
+void main() {
+    vec2 uv  = aQuad * 0.5 + 0.5;
+    vec2 doc = uOrigin + uAxisX * uv.x + uAxisY * uv.y;
+    vDocPos  = doc;
+    vec4 bufPx = uTransform * vec4(doc, 0.0, 1.0);
+    vec2 ndc   = (bufPx.xy / uScreen) * 2.0 - 1.0;
+    gl_Position = vec4(ndc, 0.0, 1.0);
+    vUv = uv;
+}
+)";
+
+const char* kTextFS = R"(#version 300 es
+precision mediump float;
+in vec2 vUv;
+in vec2 vDocPos;
+uniform sampler2D uTex;      // uMode 0: R8 coverage; 1: premultiplied RGBA
+uniform vec4  uColor;        // straight RGBA (mode 0 tint)
+uniform float uOpacity;
+uniform int   uMode;
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
+out vec4 outColor;
+void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
+    if (uMode == 1) {
+        // Mixed-colour box: the raster already carries colour
+        // (premultiplied); only the layer opacity applies.
+        vec4 t = texture(uTex, vUv) * uOpacity;
+        if (t.a <= 0.0) discard;
+        outColor = t;
+        return;
+    }
+    float cov = texture(uTex, vUv).r;
+    float a = cov * uColor.a * uOpacity;
+    if (a <= 0.0) discard;
+    outColor = vec4(uColor.rgb * a, a);
+}
+)";
+
 // Page-background grid. A fullscreen NDC quad whose fragment shader
 // computes each pixel's document position via the inverse of the
 // framework's transform matrix, then evaluates a periodic line/dot
@@ -989,6 +1050,49 @@ struct Circle {
     float    width;
 };
 
+// Text box on a vector layer. The model (text + per-box style + box) is
+// the document truth — "vector" in the sense that it re-lays-out and
+// re-rasterizes at any scale. Kotlin owns layout and rasterization
+// (android.text.StaticLayout); native stores the model, draws the
+// cached coverage texture (see g_textTextures), and handles selection
+// / transform / undo like any other shape. NOT POD — serialized
+// field-by-field with length-prefixed strings (see saveVectorLayer).
+// Per-character style override on a range of a TextBox's text. Offsets
+// are UTF-16 code units (Kotlin's String indexing — Kotlin owns layout,
+// native only stores these). Flags ADD to the box's base style; the
+// Kotlin side normalizes so the base holds whatever applies to every
+// character and runs carry the exceptions.
+struct TextRun {
+    uint32_t start = 0, end = 0;
+    uint8_t  flags = 0;            // 1 bold, 2 italic, 4 underline, 8 has colour
+    uint32_t color = 0;            // 0xRRGGBB when flags & 8
+};
+constexpr uint8_t kRunBold = 1, kRunItalic = 2, kRunUnderline = 4, kRunHasColor = 8;
+
+struct TextBox {
+    uint32_t    id = 0;            // stable identity for the texture cache; random, < 2^24
+    float       x = 0.0f, y = 0.0f; // unrotated top-left, doc px
+    float       w = 0.0f, h = 0.0f; // box size, doc px (h follows content; w too when autoWidth)
+    float       rotation = 0.0f;    // radians about the box centre
+    uint32_t    color = 0;          // 0xRRGGBB
+    float       fontSize = 24.0f;   // doc px
+    float       lineSpacing = 1.0f; // multiplier
+    uint8_t     bold = 0, italic = 0, align = 0, autoWidth = 0;  // align: 0 left, 1 centre, 2 right
+    std::string fontKey;            // font registry key (Kotlin), e.g. "inter"
+    std::string text;               // UTF-8
+    std::vector<TextRun> runs;      // per-range style overrides (may be empty)
+};
+constexpr float kTextMinWidth = 16.0f;   // doc px
+
+inline bool textRunsEqual(const std::vector<TextRun>& a, const std::vector<TextRun>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].start != b[i].start || a[i].end != b[i].end
+            || a[i].flags != b[i].flags || a[i].color != b[i].color) return false;
+    }
+    return true;
+}
+
 struct Layer {
     LayerType type = LayerType::Raster;
     std::unordered_map<int64_t, Tile> tiles;   // populated for raster
@@ -999,6 +1103,7 @@ struct Layer {
     std::vector<Rect>    rects;
     std::vector<Ellipse> ellipses;
     std::vector<Circle>  circles;
+    std::vector<TextBox> texts;
     // User-set display name. Empty = caller renders a default like
     // "layer N" / "vector N". Persisted at <layerDir>/name.txt; reads/
     // writes are guarded by g_layerNameMutex (see below).
@@ -1126,6 +1231,22 @@ struct RectProg {
     GLint  uPageActive = -1;
 };
 
+struct TextProg {
+    GLuint program     = 0;
+    GLint  uMode       = -1;
+    GLint  uTransform  = -1;
+    GLint  uScreen     = -1;
+    GLint  uOrigin     = -1;
+    GLint  uAxisX      = -1;
+    GLint  uAxisY      = -1;
+    GLint  uTex        = -1;
+    GLint  uColor      = -1;
+    GLint  uOpacity    = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
+};
+
 struct PixelGridProg {
     GLuint program          = 0;
     GLint  uInverseTransform = -1;
@@ -1202,6 +1323,7 @@ GridProg    g_grid;
 LineProg    g_lineProg;
 EllipseProg g_ellipseProg;
 RectProg    g_rectProg;
+TextProg    g_textProg;
 PixelGridProg g_pixelGridProg;
 StampProg   g_stamp;
 FillProg    g_fill;
@@ -1735,6 +1857,103 @@ std::vector<Line>    g_pendingLines;
 std::vector<Rect>    g_pendingRects;
 std::vector<Ellipse> g_pendingEllipses;
 std::vector<Circle>  g_pendingCircles;
+// Text boxes: adds are provisional (no undo entry until the first
+// commit of non-empty text); edits carry the full new state keyed by
+// id and push VectorAdd / VectorMutate on the GL thread; removes drop
+// an (empty) box without an undo entry.
+std::vector<TextBox> g_pendingTextAdds;
+struct PendingTextEdit { TextBox box; bool undoable; };
+std::vector<PendingTextEdit> g_pendingTextEdits;
+std::vector<uint32_t> g_pendingTextRemoves;
+
+// Text raster cache. One R8 coverage texture per text box id, uploaded
+// by Kotlin (uploadTextRaster) and drained on the GL thread at the top
+// of the composite. `scale` is the doc-px → texel factor the bitmap
+// was rendered at; the compositor asks Kotlin for a fresh raster when
+// the view scale drifts more than kTextRasterBand from it. Entries
+// survive delete (undo may bring the box back) and page switches;
+// they're evicted when a document is loaded.
+struct TextTexture {
+    GLuint tex   = 0;
+    int    w     = 0, h = 0;   // texels
+    float  scale = 1.0f;
+    int    channels = 1;       // 1 = R8 coverage (tinted), 4 = premultiplied RGBA
+};
+std::unordered_map<uint32_t, TextTexture> g_textTextures;   // GL thread only
+struct PendingTextRaster {
+    uint32_t             id = 0;
+    int                  w = 0, h = 0;
+    float                scale = 1.0f;
+    int                  channels = 1;
+    std::vector<uint8_t> alpha;   // w*h*channels bytes, row 0 = top
+};
+std::mutex                     g_pendingTextRasterMutex;
+std::vector<PendingTextRaster> g_pendingTextRasters;
+// UI-thread-readable mirror of each texture's scale (g_textTextures is
+// GL-thread-only). getTextRasterRequests reads it to decide what to
+// re-rasterize without racing the map the compositor mutates.
+struct TextRasterInfo { float scale; float docW; };
+std::mutex                                  g_textRasterScaleMutex;
+std::unordered_map<uint32_t, TextRasterInfo> g_textRasterScales;
+// Set by the compositor when a box has no texture or a stale-scale
+// one; Kotlin polls textRasterNeeded() after each multi-buffer render
+// and re-rasterizes. Suppressed during thumbnail/export composites,
+// whose view scale is not the user's.
+std::atomic<int> g_textRasterNeeded{0};
+bool             g_suppressTextRasterRequests = false;   // GL thread only
+constexpr float  kTextRasterBand   = 1.5f;    // re-raster when scale ratio exceeds this
+constexpr int    kTextRasterMaxDim = 2048;    // texels per side
+constexpr float  kTextRasterMinScale = 0.25f;
+constexpr float  kTextRasterMaxScale = 8.0f;
+
+// A raster is usable for a box if it was rendered within
+// kTextRasterBand of the wanted scale AND for (about) the box's
+// current width — a handle-resize changes the wrap, so the box needs
+// a fresh layout even at the same zoom.
+inline bool textRasterStale(float haveScale, float haveDocW,
+                            float wantScale, float boxW) {
+    float ratio = wantScale > haveScale ? wantScale / haveScale : haveScale / wantScale;
+    if (ratio > kTextRasterBand) return true;
+    return std::fabs(haveDocW - boxW) > 1.0f;
+}
+// Box currently open in the Kotlin edit overlay: the compositor skips
+// it so the overlay is the only visual. 0 = none.
+std::atomic<uint32_t> g_textEditingId{0};
+// PDF export: Kotlin draws text boxes itself as real PDF text on top
+// of the page bitmap, so the export composite must leave them out.
+// Set around the export render; the on-screen frame after it is
+// forced to redraw.
+std::atomic<int> g_exportSkipText{0};
+
+// Scale Kotlin should rasterize a box at for the given view scale:
+// the view scale, clamped, then reduced if the box would exceed the
+// texel cap. Kotlin mirrors this formula (TextRasterizer.desiredScale).
+inline float desiredTextRasterScale(float viewScale, float w, float h) {
+    float s = std::min(std::max(viewScale, kTextRasterMinScale), kTextRasterMaxScale);
+    float maxDim = std::max(w, h);
+    if (maxDim * s > static_cast<float>(kTextRasterMaxDim)) {
+        s = static_cast<float>(kTextRasterMaxDim) / maxDim;
+    }
+    return s;
+}
+
+void evictAllTextTextures() {
+    for (auto& kv : g_textTextures) {
+        if (kv.second.tex) glDeleteTextures(1, &kv.second.tex);
+    }
+    g_textTextures.clear();
+    std::lock_guard<std::mutex> lock(g_textRasterScaleMutex);
+    g_textRasterScales.clear();
+}
+
+// Random 24-bit ids: they only need to be unique within a document,
+// and pages load lazily so a counter seeded at load time could still
+// collide with ids handed out before a later page came in.
+uint32_t newTextBoxId() {
+    static std::mt19937 rng{std::random_device{}()};
+    std::uniform_int_distribution<uint32_t> dist(1u, (1u << 24) - 1u);
+    return dist(rng);
+}
 
 // Current selection — at most one shape on a vector layer. Mutated from
 // the UI thread (tap to select) and read from the GL thread (highlight
@@ -1745,6 +1964,7 @@ enum class ShapeKind : int {
     Rect = 2,
     Ellipse = 3,
     Circle = 4,
+    Text = 5,
 };
 
 struct Selection {
@@ -1870,6 +2090,7 @@ struct ShapeData {
     Rect    rect{};
     Ellipse ellipse{};
     Circle  circle{};
+    TextBox text{};
 };
 
 // Complete snapshot of a layer's state. Used by destructive layer ops
@@ -1886,6 +2107,7 @@ struct LayerSnapshot {
     std::vector<Rect>     rects;
     std::vector<Ellipse>  ellipses;
     std::vector<Circle>   circles;
+    std::vector<TextBox>  texts;
 };
 
 struct UndoEntry {
@@ -1938,6 +2160,7 @@ struct UndoEntry {
     std::vector<Rect>    beforeRects;
     std::vector<Ellipse> beforeEllipses;
     std::vector<Circle>  beforeCircles;
+    std::vector<TextBox> beforeTexts;
     LayerType            layerTypeBefore = LayerType::Raster;
 
     // LayerAdd: type of the layer that was appended; previous active idx.
@@ -2082,6 +2305,7 @@ size_t computeEntrySize(const UndoEntry& e) {
     s += e.beforeRects.size()    * sizeof(Rect);
     s += e.beforeEllipses.size() * sizeof(Ellipse);
     s += e.beforeCircles.size()  * sizeof(Circle);
+    for (const auto& t : e.beforeTexts) s += sizeof(TextBox) + t.text.size() + t.fontKey.size();
     // srcSnapshot — used by MergeLayerDown (and any future op that
     // captures a full layer for re-creation on undo).
     for (const auto& t : e.srcSnapshot.tiles) s += t.bytes ? t.bytes->size() : 0;
@@ -2089,6 +2313,7 @@ size_t computeEntrySize(const UndoEntry& e) {
     s += e.srcSnapshot.rects.size()    * sizeof(Rect);
     s += e.srcSnapshot.ellipses.size() * sizeof(Ellipse);
     s += e.srcSnapshot.circles.size()  * sizeof(Circle);
+    for (const auto& t : e.srcSnapshot.texts) s += sizeof(TextBox) + t.text.size() + t.fontKey.size();
     s += e.srcSnapshot.name.size();
     // Nested entries (MergeLayerDown's per-layer history capture).
     for (const auto& nested : e.srcLayerUndoEntries) {
@@ -2134,6 +2359,15 @@ bool shapeDataEqual(const ShapeData& a, const ShapeData& b) {
         case ShapeKind::Rect:    return std::memcmp(&a.rect,    &b.rect,    sizeof(Rect))    == 0;
         case ShapeKind::Ellipse: return std::memcmp(&a.ellipse, &b.ellipse, sizeof(Ellipse)) == 0;
         case ShapeKind::Circle:  return std::memcmp(&a.circle,  &b.circle,  sizeof(Circle))  == 0;
+        case ShapeKind::Text: {
+            const TextBox& p = a.text; const TextBox& q = b.text;
+            return p.id == q.id && p.x == q.x && p.y == q.y && p.w == q.w && p.h == q.h
+                && p.rotation == q.rotation && p.color == q.color
+                && p.fontSize == q.fontSize && p.lineSpacing == q.lineSpacing
+                && p.bold == q.bold && p.italic == q.italic && p.align == q.align
+                && p.autoWidth == q.autoWidth && p.fontKey == q.fontKey && p.text == q.text
+                && textRunsEqual(p.runs, q.runs);
+        }
         case ShapeKind::None:    return true;
     }
     return true;
@@ -2161,6 +2395,9 @@ bool snapshotSelectionShape(const Selection& sel, ShapeData& out) {
         case ShapeKind::Circle:
             if (sel.shapeIdx >= layer.circles.size()) return false;
             out.circle = layer.circles[sel.shapeIdx]; return true;
+        case ShapeKind::Text:
+            if (sel.shapeIdx >= layer.texts.size()) return false;
+            out.text = layer.texts[sel.shapeIdx]; return true;
         case ShapeKind::None:
             return false;
     }
@@ -2319,7 +2556,11 @@ void rasterizeShapesIntoTiles(size_t targetLayerIdx,
                               const std::vector<Line>&    lines,
                               const std::vector<Rect>&    rects,
                               const std::vector<Ellipse>& ellipses,
-                              const std::vector<Circle>&  circles);
+                              const std::vector<Circle>&  circles,
+                              const std::vector<TextBox>& texts);
+void drawTextBoxes(JNIEnv* env, const std::vector<TextBox>& texts,
+                   const float* transform, int width, int height,
+                   const PageClip& pageClip, float opacity);
 void rasterizeVectorLayerImpl(size_t layerIdx);
 void rasterizeShapeBelowImpl();
 void mergeRasterLayerDownImpl(size_t layerIdx);
@@ -2440,12 +2681,14 @@ void applyPendingLayerActions() {
                 undo.beforeRects    = layer.rects;
                 undo.beforeEllipses = layer.ellipses;
                 undo.beforeCircles  = layer.circles;
+                undo.beforeTexts    = layer.texts;
             }
             bool somethingToUndo = !undo.beforeTiles.empty()
                                 || !undo.beforeLines.empty()
                                 || !undo.beforeRects.empty()
                                 || !undo.beforeEllipses.empty()
-                                || !undo.beforeCircles.empty();
+                                || !undo.beforeCircles.empty()
+                                || !undo.beforeTexts.empty();
             // Drop GL resources for raster tiles.
             for (auto& kv : layer.tiles) {
                 if (kv.second.fbo)     glDeleteFramebuffers(1, &kv.second.fbo);
@@ -2457,6 +2700,7 @@ void applyPendingLayerActions() {
             layer.rects.clear();
             layer.ellipses.clear();
             layer.circles.clear();
+            layer.texts.clear();
             // Wipe the on-disk copy so the cleared state persists.
             // Metadata files (name.txt, opacity.txt, hidden.flag) belong
             // to the layer itself, not its content — keep them so a
@@ -2516,6 +2760,7 @@ void applyPendingLayerActions() {
             LOGI("page added (count=%zu, active=%zu)",
                  g_pages.size(), g_activePageIdx);
         } else if (a == kActionLoadDocument) {
+            evictAllTextTextures();
             std::string newPath;
             {
                 std::lock_guard<std::mutex> lock(g_pendingDocPathMutex);
@@ -2899,6 +3144,24 @@ void ensureInited() {
     g_ellipseProg.uPageActive = glGetUniformLocation(g_ellipseProg.program, "uPageActive");
     glUseProgram(g_ellipseProg.program);
     glUniform1f(g_ellipseProg.uOpacity, 1.0f);
+    glUseProgram(0);
+
+    g_textProg.program     = linkProgram(kTextVS, kTextFS);
+    g_textProg.uTransform  = glGetUniformLocation(g_textProg.program, "uTransform");
+    g_textProg.uScreen     = glGetUniformLocation(g_textProg.program, "uScreen");
+    g_textProg.uOrigin     = glGetUniformLocation(g_textProg.program, "uOrigin");
+    g_textProg.uAxisX      = glGetUniformLocation(g_textProg.program, "uAxisX");
+    g_textProg.uAxisY      = glGetUniformLocation(g_textProg.program, "uAxisY");
+    g_textProg.uTex        = glGetUniformLocation(g_textProg.program, "uTex");
+    g_textProg.uColor      = glGetUniformLocation(g_textProg.program, "uColor");
+    g_textProg.uOpacity    = glGetUniformLocation(g_textProg.program, "uOpacity");
+    g_textProg.uMode       = glGetUniformLocation(g_textProg.program, "uMode");
+    g_textProg.uPageMin    = glGetUniformLocation(g_textProg.program, "uPageMin");
+    g_textProg.uPageMax    = glGetUniformLocation(g_textProg.program, "uPageMax");
+    g_textProg.uPageActive = glGetUniformLocation(g_textProg.program, "uPageActive");
+    glUseProgram(g_textProg.program);
+    glUniform1i(g_textProg.uTex, 0);
+    glUniform1f(g_textProg.uOpacity, 1.0f);
     glUseProgram(0);
 
     g_rectProg.program     = linkProgram(kRectVS, kRectFS);
@@ -3528,6 +3791,7 @@ void captureLayerSnapshot(size_t layerIdx, LayerSnapshot& out) {
         out.rects    = layer.rects;
         out.ellipses = layer.ellipses;
         out.circles  = layer.circles;
+        out.texts    = layer.texts;
     }
 }
 
@@ -3568,6 +3832,7 @@ void insertLayerWithSnapshot(size_t idx, const LayerSnapshot& snap) {
     layer->rects    = snap.rects;
     layer->ellipses = snap.ellipses;
     layer->circles  = snap.circles;
+    layer->texts    = snap.texts;
     ls.insert(ls.begin() + idx, std::move(layer));
 
     // Restore raster tiles (creates GL textures + saves to disk).
@@ -4195,8 +4460,10 @@ void rasterizeShapesIntoTiles(size_t targetLayerIdx,
                               const std::vector<Line>&    lines,
                               const std::vector<Rect>&    rects,
                               const std::vector<Ellipse>& ellipses,
-                              const std::vector<Circle>&  circles) {
-    if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty()) {
+                              const std::vector<Circle>&  circles,
+                              const std::vector<TextBox>& texts) {
+    if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty()
+        && texts.empty()) {
         return;
     }
     if (targetLayerIdx >= layers().size() || !layers()[targetLayerIdx]) return;
@@ -4275,6 +4542,13 @@ void rasterizeShapesIntoTiles(size_t targetLayerIdx,
     for (const auto& c : circles) {
         drawEllipseAsLines(c.cx, c.cy, c.radius, c.radius, /*rotation*/ 0.0f,
                            c.color, c.width, 1.0f);
+    }
+    // Text boxes draw their cached coverage textures — the same quads
+    // the compositor draws, under the doc→tempFbo translate. A box
+    // whose raster hasn't arrived yet contributes nothing.
+    if (!texts.empty()) {
+        drawTextBoxes(nullptr, texts, t, pageW, pageH,
+                      PageClip{false, 0, 0, 0, 0}, 1.0f);
     }
     glBindVertexArray(0);
 
@@ -4393,7 +4667,7 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
     Layer& src = *layers()[layerIdx];
     if (src.type != LayerType::Vector) return;
     if (src.lines.empty() && src.rects.empty()
-        && src.ellipses.empty() && src.circles.empty()) {
+        && src.ellipses.empty() && src.circles.empty() && src.texts.empty()) {
         // Empty vector layer — just flip the type and drop shapes.bin.
         // No undo entry: nothing user-visible changed.
         src.type = LayerType::Raster;
@@ -4416,6 +4690,7 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
     entry.beforeRects     = src.rects;
     entry.beforeEllipses  = src.ellipses;
     entry.beforeCircles   = src.circles;
+    entry.beforeTexts     = src.texts;
 
     // Promote the layer type up front so rasterizeShapesIntoTiles
     // accepts it as a raster target. If we promoted after the call,
@@ -4427,8 +4702,9 @@ void rasterizeVectorLayerImpl(size_t layerIdx) {
     std::vector<Rect>    rs = std::move(src.rects);    src.rects.clear();
     std::vector<Ellipse> es = std::move(src.ellipses); src.ellipses.clear();
     std::vector<Circle>  cs = std::move(src.circles);  src.circles.clear();
+    std::vector<TextBox> ts = std::move(src.texts);    src.texts.clear();
 
-    rasterizeShapesIntoTiles(layerIdx, ls, rs, es, cs);
+    rasterizeShapesIntoTiles(layerIdx, ls, rs, es, cs, ts);
 
     // Capture the resulting tiles so redo can re-apply them without
     // re-running the GPU rasterize path.
@@ -4528,6 +4804,17 @@ DocBbox shapeAabb(const ShapeData& s) {
             pad += c.width * 0.5f;
             break;
         }
+        case ShapeKind::Text: {
+            const TextBox& t = s.text;
+            float cx = t.x + t.w * 0.5f, cy = t.y + t.h * 0.5f;
+            float hw = t.w * 0.5f, hh = t.h * 0.5f;
+            float c = std::cos(t.rotation), si = std::sin(t.rotation);
+            float ax = std::fabs(hw * c) + std::fabs(hh * si);
+            float ay = std::fabs(hw * si) + std::fabs(hh * c);
+            b.minX = cx - ax; b.maxX = cx + ax;
+            b.minY = cy - ay; b.maxY = cy + ay;
+            break;
+        }
         default: return b;
     }
     b.minX -= pad; b.minY -= pad;
@@ -4574,6 +4861,7 @@ void rasterizeShapeBelowImpl() {
     std::vector<Rect>    rs;
     std::vector<Ellipse> es;
     std::vector<Circle>  cs;
+    std::vector<TextBox> ts;
     switch (sel.kind) {
         case ShapeKind::Line:
             if (sel.shapeIdx >= src.lines.size())    return;
@@ -4598,6 +4886,12 @@ void rasterizeShapeBelowImpl() {
             beforeShape.circle = src.circles[sel.shapeIdx];
             cs.push_back(beforeShape.circle);
             src.circles.erase(src.circles.begin() + sel.shapeIdx);
+            break;
+        case ShapeKind::Text:
+            if (sel.shapeIdx >= src.texts.size())    return;
+            beforeShape.text = src.texts[sel.shapeIdx];
+            ts.push_back(beforeShape.text);
+            src.texts.erase(src.texts.begin() + sel.shapeIdx);
             break;
         default: return;
     }
@@ -4624,10 +4918,10 @@ void rasterizeShapeBelowImpl() {
         int ty1 = tileFloorDiv(
             static_cast<int>(std::ceil(bb.maxY) - 1), kTileSize);
         snapshotTilesInBbox(targetIdx, tx0, tx1, ty0, ty1, beforeTiles);
-        rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs);
+        rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs, ts);
         snapshotTilesInBbox(targetIdx, tx0, tx1, ty0, ty1, afterTiles);
     } else {
-        rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs);
+        rasterizeShapesIntoTiles(targetIdx, ls, rs, es, cs, ts);
     }
 
     // Persist the source layer's new (one-shape-shorter) state.
@@ -5324,10 +5618,87 @@ void ensureLoaded() {
 
 constexpr uint32_t kShapesMagicV0   = 0x30434556u;   // "VEC0" — pre-rotation
 constexpr uint32_t kShapesMagicV1   = 0x31434556u;   // "VEC1" — Rect/Ellipse have rotation
+constexpr uint32_t kShapesMagicV2   = 0x32434556u;   // "VEC2" — adds TextBox (tag 5, non-POD)
+constexpr uint32_t kShapesMagicV3   = 0x33434556u;   // "VEC3" — TextBox carries style runs
 constexpr uint8_t  kShapeTypeLine    = 1;
 constexpr uint8_t  kShapeTypeRect    = 2;
 constexpr uint8_t  kShapeTypeEllipse = 3;
 constexpr uint8_t  kShapeTypeCircle  = 4;
+constexpr uint8_t  kShapeTypeText    = 5;
+
+// TextBox is not POD (two strings), so it goes to disk field by field:
+// the fixed fields as a packed header, then each string as u32 length
+// + bytes. Add new fields at the END of the header and bump the magic
+// if the layout changes.
+struct TextBoxDiskHeader {
+    uint32_t id;
+    float    x, y, w, h, rotation;
+    uint32_t color;
+    float    fontSize, lineSpacing;
+    uint8_t  bold, italic, align, autoWidth;
+};
+static_assert(sizeof(TextBoxDiskHeader) == 40, "TextBoxDiskHeader layout");
+
+void writeLenString(FILE* f, const std::string& str) {
+    uint32_t n = static_cast<uint32_t>(str.size());
+    fwrite(&n, sizeof(n), 1, f);
+    if (n) fwrite(str.data(), 1, n, f);
+}
+
+bool readLenString(FILE* f, std::string& out) {
+    uint32_t n = 0;
+    if (fread(&n, sizeof(n), 1, f) != 1) return false;
+    if (n > (1u << 24)) return false;   // corrupt guard
+    out.resize(n);
+    if (n && fread(&out[0], 1, n, f) != n) return false;
+    return true;
+}
+
+void writeTextBox(FILE* f, const TextBox& t) {
+    TextBoxDiskHeader h{ t.id, t.x, t.y, t.w, t.h, t.rotation, t.color,
+                         t.fontSize, t.lineSpacing,
+                         t.bold, t.italic, t.align, t.autoWidth };
+    fwrite(&h, sizeof(h), 1, f);
+    writeLenString(f, t.fontKey);
+    writeLenString(f, t.text);
+    // V3: style runs, written field by field (no struct padding on disk).
+    uint32_t n = static_cast<uint32_t>(t.runs.size());
+    fwrite(&n, sizeof(n), 1, f);
+    for (const auto& r : t.runs) {
+        fwrite(&r.start, sizeof(r.start), 1, f);
+        fwrite(&r.end,   sizeof(r.end),   1, f);
+        fwrite(&r.flags, sizeof(r.flags), 1, f);
+        fwrite(&r.color, sizeof(r.color), 1, f);
+    }
+}
+
+bool readTextBox(FILE* f, TextBox& t, bool withRuns) {
+    TextBoxDiskHeader h;
+    if (fread(&h, sizeof(h), 1, f) != 1) return false;
+    t.id = h.id; t.x = h.x; t.y = h.y; t.w = h.w; t.h = h.h;
+    t.rotation = h.rotation; t.color = h.color;
+    t.fontSize = h.fontSize; t.lineSpacing = h.lineSpacing;
+    t.bold = h.bold; t.italic = h.italic; t.align = h.align; t.autoWidth = h.autoWidth;
+    if (!readLenString(f, t.fontKey)) return false;
+    if (!readLenString(f, t.text)) return false;
+    t.runs.clear();
+    if (withRuns) {
+        uint32_t n = 0;
+        if (fread(&n, sizeof(n), 1, f) != 1) return false;
+        if (n > (1u << 20)) return false;   // corrupt guard
+        t.runs.reserve(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            TextRun r;
+            if (fread(&r.start, sizeof(r.start), 1, f) != 1) return false;
+            if (fread(&r.end,   sizeof(r.end),   1, f) != 1) return false;
+            if (fread(&r.flags, sizeof(r.flags), 1, f) != 1) return false;
+            if (fread(&r.color, sizeof(r.color), 1, f) != 1) return false;
+            t.runs.push_back(r);
+        }
+    }
+    if (t.id == 0) t.id = newTextBoxId();
+    return true;
+}
 
 // Pre-rotation struct layouts, used only for migrating V0 files. Keep
 // these byte-for-byte identical to what V0 was writing.
@@ -5368,10 +5739,11 @@ void saveVectorLayer(size_t layerIdx, const Layer& layer) {
         LOGE("save vector layer %zu: fopen failed", layerIdx);
         return;
     }
-    uint32_t magic = kShapesMagicV1;
+    uint32_t magic = kShapesMagicV3;
     uint32_t count = static_cast<uint32_t>(
         layer.lines.size() + layer.rects.size()
-        + layer.ellipses.size() + layer.circles.size());
+        + layer.ellipses.size() + layer.circles.size()
+        + layer.texts.size());
     fwrite(&magic, sizeof(magic), 1, f);
     fwrite(&count, sizeof(count), 1, f);
     for (const auto& l : layer.lines) {
@@ -5386,6 +5758,9 @@ void saveVectorLayer(size_t layerIdx, const Layer& layer) {
     for (const auto& c : layer.circles) {
         uint8_t t = kShapeTypeCircle;  fwrite(&t, 1, 1, f); fwrite(&c, sizeof(Circle),  1, f);
     }
+    for (const auto& tb : layer.texts) {
+        uint8_t t = kShapeTypeText;    fwrite(&t, 1, 1, f); writeTextBox(f, tb);
+    }
     fclose(f);
     if (rename(tmpPath.c_str(), path.c_str()) != 0) {
         LOGE("save vector layer %zu: rename failed", layerIdx);
@@ -5399,12 +5774,14 @@ void loadVectorLayerShapes(Layer& layer, const std::string& dir) {
 
     uint32_t magic = 0, count = 0;
     if (fread(&magic, sizeof(magic), 1, f) != 1
-        || (magic != kShapesMagicV0 && magic != kShapesMagicV1)) {
+        || (magic != kShapesMagicV0 && magic != kShapesMagicV1
+            && magic != kShapesMagicV2 && magic != kShapesMagicV3)) {
         LOGE("vector layer at %s: bad magic 0x%x", dir.c_str(), magic);
         fclose(f);
         return;
     }
     bool migrate = (magic == kShapesMagicV0);
+    bool textRuns = (magic == kShapesMagicV3);
     if (fread(&count, sizeof(count), 1, f) != 1) {
         fclose(f);
         return;
@@ -5432,6 +5809,8 @@ void loadVectorLayerShapes(Layer& layer, const std::string& dir) {
             }
         } else if (type == kShapeTypeCircle) {
             Circle c;  if (fread(&c, sizeof(Circle),  1, f) != 1) break; layer.circles.push_back(c);
+        } else if (type == kShapeTypeText) {
+            TextBox tb; if (!readTextBox(f, tb, textRuns)) break; layer.texts.push_back(std::move(tb));
         } else {
             LOGE("vector layer at %s: unknown shape type %d", dir.c_str(), type);
             break;
@@ -5441,24 +5820,166 @@ void loadVectorLayerShapes(Layer& layer, const std::string& dir) {
     // After migrating, rewrite in V1 format so subsequent loads are clean.
     // Caller will trigger save naturally on next stroke; but write here too.
     // (No-op for V1 files since we'd just overwrite identical content.)
-    LOGI("loaded %zu lines + %zu rects + %zu ellipses + %zu circles from %s",
+    LOGI("loaded %zu lines + %zu rects + %zu ellipses + %zu circles + %zu texts from %s",
          layer.lines.size(), layer.rects.size(),
-         layer.ellipses.size(), layer.circles.size(), dir.c_str());
+         layer.ellipses.size(), layer.circles.size(), layer.texts.size(),
+         dir.c_str());
 }
 
 // ---- Pending vector-layer shape additions --------------------------------
 
+// Locate a text box by id on the active page. Returns nullptr if absent.
+TextBox* findTextBoxById(uint32_t id, size_t* layerOut, size_t* idxOut) {
+    auto& ls = layers();
+    for (size_t li = 0; li < ls.size(); ++li) {
+        if (!ls[li]) continue;
+        auto& ts = ls[li]->texts;
+        for (size_t i = 0; i < ts.size(); ++i) {
+            if (ts[i].id == id) {
+                if (layerOut) *layerOut = li;
+                if (idxOut)   *idxOut = i;
+                return &ts[i];
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Upload Kotlin-rasterized text coverage bitmaps into R8 textures.
+// GL thread. Replaces any existing texture for the same id.
+void applyPendingTextRasters() {
+    std::vector<PendingTextRaster> pending;
+    {
+        std::lock_guard<std::mutex> lock(g_pendingTextRasterMutex);
+        pending.swap(g_pendingTextRasters);
+    }
+    if (pending.empty()) return;
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    for (auto& p : pending) {
+        TextTexture& tt = g_textTextures[p.id];
+        if (!tt.tex) glGenTextures(1, &tt.tex);
+        glBindTexture(GL_TEXTURE_2D, tt.tex);
+        if (p.channels == 4) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, p.w, p.h, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, p.alpha.data());
+        } else {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, p.w, p.h, 0,
+                         GL_RED, GL_UNSIGNED_BYTE, p.alpha.data());
+        }
+        tt.channels = p.channels;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glGenerateMipmap(GL_TEXTURE_2D);
+        tt.w = p.w; tt.h = p.h; tt.scale = p.scale;
+        {
+            std::lock_guard<std::mutex> lock(g_textRasterScaleMutex);
+            g_textRasterScales[p.id] = TextRasterInfo{
+                p.scale, static_cast<float>(p.w) / p.scale };
+        }
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g_mbCacheValid = false;
+}
+
 void applyPendingShapes() {
+    applyPendingTextRasters();
+
     std::vector<Line>    lines;
     std::vector<Rect>    rects;
     std::vector<Ellipse> ellipses;
     std::vector<Circle>  circles;
+    std::vector<TextBox> textAdds;
+    std::vector<PendingTextEdit> textEdits;
+    std::vector<uint32_t> textRemoves;
     {
         std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
         lines.swap(g_pendingLines);
         rects.swap(g_pendingRects);
         ellipses.swap(g_pendingEllipses);
         circles.swap(g_pendingCircles);
+        textAdds.swap(g_pendingTextAdds);
+        textEdits.swap(g_pendingTextEdits);
+        textRemoves.swap(g_pendingTextRemoves);
+    }
+    // Provisional text adds land first so an edit queued in the same
+    // frame (fast commit) can find its box. No undo entry until the
+    // first non-empty commit (see the edits drain), so an abandoned
+    // empty box leaves no trace in the history.
+    if (!textAdds.empty()) {
+        g_mbCacheValid = false;
+        ensureAtLeastOnePage();
+        if (activeLayer() < layers().size() && layers()[activeLayer()]
+            && layers()[activeLayer()]->type == LayerType::Vector) {
+            Layer& al = *layers()[activeLayer()];
+            for (auto& t : textAdds) al.texts.push_back(std::move(t));
+            saveVectorLayer(activeLayer(), al);
+        } else {
+            LOGE("dropping queued text box: active layer is not vector");
+        }
+    }
+    // Text edits / removes address boxes by id anywhere on the page,
+    // so they don't go through the active-layer gate below.
+    if (!textEdits.empty() || !textRemoves.empty()) {
+        g_mbCacheValid = false;
+        std::vector<size_t> touched;
+        auto touch = [&](size_t li) {
+            if (std::find(touched.begin(), touched.end(), li) == touched.end())
+                touched.push_back(li);
+        };
+        for (auto& pe : textEdits) {
+            size_t li = 0, idx = 0;
+            TextBox* tb = findTextBoxById(pe.box.id, &li, &idx);
+            if (!tb) continue;
+            TextBox before = *tb;
+            *tb = pe.box;
+            if (pe.undoable) {
+                UndoEntry e;
+                e.layerIdx = li;
+                e.shapeIdx = idx;
+                e.afterShape.kind = ShapeKind::Text;
+                e.afterShape.text = *tb;
+                if (before.text.empty()) {
+                    // First commit of a provisional box: the "add" is
+                    // what the user perceives, so that's the undo unit.
+                    e.op = UndoOp::VectorAdd;
+                } else {
+                    e.op = UndoOp::VectorMutate;
+                    e.beforeShape.kind = ShapeKind::Text;
+                    e.beforeShape.text = before;
+                }
+                pushUndoEntry(std::move(e));
+            }
+            touch(li);
+        }
+        for (uint32_t id : textRemoves) {
+            size_t li = 0, idx = 0;
+            TextBox* tb = findTextBoxById(id, &li, &idx);
+            if (!tb) continue;
+            Layer& layer = *layers()[li];
+            if (!tb->text.empty()) {
+                UndoEntry e;
+                e.op = UndoOp::VectorDelete;
+                e.layerIdx = li;
+                e.shapeIdx = idx;
+                e.beforeShape.kind = ShapeKind::Text;
+                e.beforeShape.text = *tb;
+                pushUndoEntry(std::move(e));
+            }
+            layer.texts.erase(layer.texts.begin() + idx);
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                if (g_selection.kind == ShapeKind::Text
+                    && g_selection.layerIdx == li && g_selection.shapeIdx == idx) {
+                    g_selection = Selection{};
+                    g_extraSelections.clear();
+                }
+            }
+            touch(li);
+        }
+        for (size_t li : touched) saveVectorLayer(li, *layers()[li]);
     }
     if (lines.empty() && rects.empty() && ellipses.empty() && circles.empty())
         return;
@@ -6570,6 +7091,20 @@ Obb obbForCircle(const Circle& c) {
     return { c.cx, c.cy, c.radius, c.radius, 0.0f };
 }
 
+Obb obbForText(const TextBox& t) {
+    return { t.x + t.w * 0.5f, t.y + t.h * 0.5f,
+             std::max(t.w * 0.5f, 1.0f), std::max(t.h * 0.5f, 1.0f), t.rotation };
+}
+
+// Point-in-box test in the box's rotated frame, with `pad` doc-px of
+// slack outside the edges.
+bool textBoxContains(const TextBox& t, float x, float y, float pad) {
+    Obb o = obbForText(t);
+    float lx, ly;
+    rotateWorldToLocal(o, x, y, lx, ly);
+    return std::fabs(lx) <= o.hw + pad && std::fabs(ly) <= o.hh + pad;
+}
+
 // OBB for the floating raster selection (its placement, not the source
 // lift bbox — those diverge once the user scales/rotates). Caller must
 // hold g_rasterSelMutex; helper is just the field-shuffle.
@@ -6609,6 +7144,12 @@ bool obbForSelection(const Selection& sel, Obb& out) {
             if (sel.shapeIdx < layer.circles.size()) {
                 Circle snap = layer.circles[sel.shapeIdx];
                 out = obbForCircle(snap); return true;
+            }
+            break;
+        case ShapeKind::Text:
+            if (sel.shapeIdx < layer.texts.size()) {
+                TextBox snap = layer.texts[sel.shapeIdx];
+                out = obbForText(snap); return true;
             }
             break;
         case ShapeKind::None:
@@ -6678,6 +7219,21 @@ void forEachShapeSnapTarget(const F& cb, const Selection* exclude = nullptr) {
             cb(c.cx - c.radius, c.cy);
             cb(c.cx, c.cy + c.radius);
             cb(c.cx, c.cy - c.radius);
+        }
+        // Text boxes snap like rectangles: corners, edge midpoints, centre.
+        for (size_t i = 0; i < layer->texts.size(); ++i) {
+            if (skip(ShapeKind::Text, i)) continue;
+            Obb o = obbForText(layer->texts[i]);
+            float cx, cy;
+            rotateLocalToWorld(o, -o.hw, -o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, +o.hw, -o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, +o.hw, +o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, -o.hw, +o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, 0,     -o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, 0,     +o.hh, cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, +o.hw, 0,     cx, cy); cb(cx, cy);
+            rotateLocalToWorld(o, -o.hw, 0,     cx, cy); cb(cx, cy);
+            cb(o.cx, o.cy);
         }
     }
 }
@@ -7154,6 +7710,15 @@ bool shapeOutlineIntersectsMarquee(const ShapeData& s,
                                                c.width * 0.5f,
                                                mx0, my0, mx1, my1);
         }
+        case ShapeKind::Text: {
+            // Treat the box edge as a zero-width rect outline, plus a
+            // containment test so a marquee fully inside a big box
+            // still picks it up.
+            const TextBox& t = s.text;
+            Rect r{ t.x, t.y, t.x + t.w, t.y + t.h, t.rotation, 0u, 0.0f };
+            if (rectOutlineIntersectsAabb(r, mx0, my0, mx1, my1)) return true;
+            return textBoxContains(t, (mx0 + mx1) * 0.5f, (my0 + my1) * 0.5f, 0.0f);
+        }
         default:
             return false;
     }
@@ -7200,6 +7765,13 @@ bool hitTestActiveVectorLayer(float x, float y) {
             hitKind = ShapeKind::Circle; hitIdx = i;
         }
     }
+    // Text boxes hit on their interior (a tap on the words), not just
+    // the edge — there is no visible outline to aim for.
+    for (size_t i = 0; i < layer.texts.size(); ++i) {
+        if (textBoxContains(layer.texts[i], x, y, pad)) {
+            hitKind = ShapeKind::Text; hitIdx = i;
+        }
+    }
 
     std::lock_guard<std::mutex> lock(g_selectionMutex);
     // Single-tap selection always replaces any prior multi-selection;
@@ -7215,10 +7787,72 @@ bool hitTestActiveVectorLayer(float x, float y) {
     return true;
 }
 
+// Draw text boxes as textured quads with the text program. `env` may be
+// null (rasterize path); `transform` is the raw doc→target matrix.
+// Boxes without an uploaded raster are skipped and flag a raster
+// request; the box open in the edit overlay is skipped silently.
+void drawTextBoxes(JNIEnv* /*env*/, const std::vector<TextBox>& texts,
+                   const float* transform, int width, int height,
+                   const PageClip& pageClip, float opacity) {
+    if (texts.empty()) return;
+    if (g_exportSkipText.load()) return;
+    const uint32_t editing = g_textEditingId.load();
+    const float viewScale = currentViewScale();
+    glUseProgram(g_textProg.program);
+    glBindVertexArray(g_quadVao);
+    glUniformMatrix4fv(g_textProg.uTransform, 1, GL_FALSE, transform);
+    glUniform2f(g_textProg.uScreen, (float)width, (float)height);
+    uploadPageClip(g_textProg.uPageMin, g_textProg.uPageMax,
+                   g_textProg.uPageActive, pageClip);
+    glUniform1f(g_textProg.uOpacity, opacity);
+    glActiveTexture(GL_TEXTURE0);
+    for (size_t i = 0; i < texts.size(); ++i) {
+        const TextBox t = texts[i];   // value copy — see compositeVectorLayer
+        if (t.id == editing) continue;
+        auto it = g_textTextures.find(t.id);
+        bool stale = false;
+        if (it != g_textTextures.end() && !g_suppressTextRasterRequests) {
+            float want = desiredTextRasterScale(viewScale, t.w, t.h);
+            stale = textRasterStale(it->second.scale,
+                                    static_cast<float>(it->second.w) / it->second.scale,
+                                    want, t.w);
+        }
+        if (it == g_textTextures.end() || stale) {
+            if (!g_suppressTextRasterRequests) g_textRasterNeeded.store(1);
+            if (it == g_textTextures.end()) continue;
+        }
+        const TextTexture& tt = it->second;
+        if (!tt.tex || tt.w <= 0 || tt.h <= 0) continue;
+        // The texture covers (tt.w/scale, tt.h/scale) doc px from the
+        // box's rotated top-left — a hair more than (w, h) because the
+        // bitmap dims were rounded up.
+        float docW = static_cast<float>(tt.w) / tt.scale;
+        float docH = static_cast<float>(tt.h) / tt.scale;
+        float c = std::cos(t.rotation), sn = std::sin(t.rotation);
+        float cx = t.x + t.w * 0.5f, cy = t.y + t.h * 0.5f;
+        float hx = -t.w * 0.5f, hy = -t.h * 0.5f;
+        float ox = cx + hx * c - hy * sn;
+        float oy = cy + hx * sn + hy * c;
+        glUniform2f(g_textProg.uOrigin, ox, oy);
+        glUniform2f(g_textProg.uAxisX, docW * c, docW * sn);
+        glUniform2f(g_textProg.uAxisY, -docH * sn, docH * c);
+        float r = ((t.color >> 16) & 0xFFu) / 255.0f;
+        float g = ((t.color >>  8) & 0xFFu) / 255.0f;
+        float b = ( t.color        & 0xFFu) / 255.0f;
+        glUniform4f(g_textProg.uColor, r, g, b, 1.0f);
+        glUniform1i(g_textProg.uMode, tt.channels == 4 ? 1 : 0);
+        glBindTexture(GL_TEXTURE_2D, tt.tex);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUniform1f(g_textProg.uOpacity, 1.0f);
+}
+
 void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
                           jint width, jint height, jfloatArray transform) {
     if (layer.lines.empty() && layer.rects.empty()
-        && layer.ellipses.empty() && layer.circles.empty()) return;
+        && layer.ellipses.empty() && layer.circles.empty()
+        && layer.texts.empty()) return;
 
     // Snapshot selection for this composite pass. Includes both the
     // primary single-select and any extra (marquee'd) selections so
@@ -7327,6 +7961,32 @@ void compositeVectorLayer(JNIEnv* env, const Layer& layer, size_t layerIdx,
         // Same uOpacity reset as for the line program: keep the default
         // 1.0 for non-layer callers (snap marker, shape preview).
         glUniform1f(g_ellipseProg.uOpacity, 1.0f);
+    }
+    // Text boxes: selection halo as a thin box outline (rect program),
+    // then the textured quads.
+    if (!layer.texts.empty()) {
+        bool anySel = false;
+        for (size_t i = 0; i < layer.texts.size() && !anySel; ++i)
+            anySel = inAnySel(ShapeKind::Text, i);
+        if (anySel) {
+            glUseProgram(g_rectProg.program);
+            uploadMat4(env, g_rectProg.uTransform, transform);
+            glUniform2f(g_rectProg.uScreen, (float)width, (float)height);
+            uploadPageClip(g_rectProg.uPageMin, g_rectProg.uPageMax,
+                           g_rectProg.uPageActive, pageClip);
+            glUniform1f(g_rectProg.uOpacity, 1.0f);
+            for (size_t i = 0; i < layer.texts.size(); ++i) {
+                if (!inAnySel(ShapeKind::Text, i)) continue;
+                const TextBox t = layer.texts[i];
+                drawRectOutline(t.x, t.y, t.x + t.w, t.y + t.h, t.rotation,
+                                kSelectionHaloColor, kSelectionHaloPad * 2.0f,
+                                kSelectionHaloAlpha);
+            }
+        }
+        float xf[16];
+        env->GetFloatArrayRegion(transform, 0, 16, xf);
+        drawTextBoxes(env, layer.texts, xf, width, height, pageClip,
+                      layer.opacity.load(std::memory_order_relaxed));
     }
 
     // Reset opacity so the next non-layer use of the line program
@@ -7802,6 +8462,10 @@ void insertShapeAt(Layer& layer, ShapeKind kind, size_t idx, const ShapeData& sd
             layer.circles.insert(layer.circles.begin()
                 + std::min(idx, layer.circles.size()), sd.circle);
             break;
+        case ShapeKind::Text:
+            layer.texts.insert(layer.texts.begin()
+                + std::min(idx, layer.texts.size()), sd.text);
+            break;
         case ShapeKind::None:
             break;
     }
@@ -7825,6 +8489,10 @@ void eraseShapeAt(Layer& layer, ShapeKind kind, size_t idx) {
             if (idx < layer.circles.size())
                 layer.circles.erase(layer.circles.begin() + idx);
             break;
+        case ShapeKind::Text:
+            if (idx < layer.texts.size())
+                layer.texts.erase(layer.texts.begin() + idx);
+            break;
         case ShapeKind::None:
             break;
     }
@@ -7843,6 +8511,9 @@ void assignShapeAt(Layer& layer, ShapeKind kind, size_t idx, const ShapeData& sd
             break;
         case ShapeKind::Circle:
             if (idx < layer.circles.size())  layer.circles[idx]  = sd.circle;
+            break;
+        case ShapeKind::Text:
+            if (idx < layer.texts.size())    layer.texts[idx]    = sd.text;
             break;
         case ShapeKind::None:
             break;
@@ -7950,6 +8621,7 @@ void applyEntryReverse(UndoEntry& e) {
             layer.rects    = e.beforeRects;
             layer.ellipses = e.beforeEllipses;
             layer.circles  = e.beforeCircles;
+            layer.texts    = e.beforeTexts;
             if (layer.type == LayerType::Vector) {
                 saveVectorLayer(e.layerIdx, layer);
             }
@@ -8017,6 +8689,7 @@ void applyEntryReverse(UndoEntry& e) {
             layer.rects    = e.beforeRects;
             layer.ellipses = e.beforeEllipses;
             layer.circles  = e.beforeCircles;
+            layer.texts    = e.beforeTexts;
             saveVectorLayer(e.layerIdx, layer);
             // Selection on this layer was cleared on the forward path;
             // it stays cleared on reverse.
@@ -8161,6 +8834,7 @@ void applyEntryForward(UndoEntry& e) {
             layer.rects.clear();
             layer.ellipses.clear();
             layer.circles.clear();
+            layer.texts.clear();
             clearLayerDirOnDisk(e.layerIdx);
             if (layer.type == LayerType::Vector) {
                 saveVectorLayer(e.layerIdx, layer);
@@ -8213,6 +8887,7 @@ void applyEntryForward(UndoEntry& e) {
             layer.rects.clear();
             layer.ellipses.clear();
             layer.circles.clear();
+            layer.texts.clear();
             layer.type = LayerType::Raster;
             for (const auto& s : e.afterTiles) {
                 applyTileSnap(e.layerIdx, s);
@@ -9325,6 +10000,7 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
     // Force view scale = 1 so screen-relative widths render at their
     // "natural" doc-px width (1:1 in this transform). Restore after.
     uint32_t savedScaleBits = g_viewScaleBits.load();
+    g_suppressTextRasterRequests = true;
     {
         float one = 1.0f;
         uint32_t bits;
@@ -9353,6 +10029,7 @@ void applyBucketFill(JNIEnv* env, float seedDocX, float seedDocY,
     env->DeleteLocalRef(jtransform);
 
     g_viewScaleBits.store(savedScaleBits);
+    g_suppressTextRasterRequests = false;
 
     // (2) Read pixels and free the FBO.
     std::vector<uint8_t> pixels(static_cast<size_t>(pageW) * pageH * 4);
@@ -9690,6 +10367,9 @@ void copyVectorSelectionImpl() {
             case ShapeKind::Circle:
                 if (s.shapeIdx >= layer.circles.size())  return false;
                 out.circle  = layer.circles[s.shapeIdx];  return true;
+            case ShapeKind::Text:
+                if (s.shapeIdx >= layer.texts.size())    return false;
+                out.text    = layer.texts[s.shapeIdx];    return true;
             default: return false;
         }
     };
@@ -9786,6 +10466,13 @@ void deleteAllSelectionsImpl() {
                     captured = true;
                 }
                 break;
+            case ShapeKind::Text:
+                if (s.shapeIdx < layer.texts.size()) {
+                    entry.beforeShape.text = layer.texts[s.shapeIdx];
+                    layer.texts.erase(layer.texts.begin() + s.shapeIdx);
+                    captured = true;
+                }
+                break;
             case ShapeKind::None: break;
         }
         if (captured) {
@@ -9823,7 +10510,11 @@ bool pasteVectorSelectionImpl() {
 
     std::vector<Selection> pasted;
     pasted.reserve(shapes.size());
-    for (const auto& sd : shapes) {
+    for (const ShapeData& sdSrc : shapes) {
+        ShapeData sd = sdSrc;
+        // A pasted text box is a new object: fresh id so it gets its
+        // own raster and never aliases the source's texture.
+        if (sd.kind == ShapeKind::Text) sd.text.id = newTextBoxId();
         size_t idx = 0;
         bool ok = true;
         switch (sd.kind) {
@@ -9835,6 +10526,8 @@ bool pasteVectorSelectionImpl() {
                 idx = layer.ellipses.size(); layer.ellipses.push_back(sd.ellipse); break;
             case ShapeKind::Circle:
                 idx = layer.circles.size();  layer.circles.push_back(sd.circle);   break;
+            case ShapeKind::Text:
+                idx = layer.texts.size();    layer.texts.push_back(sd.text);       break;
             default: ok = false; break;
         }
         if (!ok) continue;
@@ -10197,6 +10890,376 @@ Java_com_bk_drawing_NativeRenderer_rasterSelectionContains(
     rotateWorldToLocal(o, x, y, lx, ly);
     return (std::fabs(lx) <= o.hw && std::fabs(ly) <= o.hh)
            ? JNI_TRUE : JNI_FALSE;
+}
+
+// ---- Text boxes ------------------------------------------------------------
+//
+// Kotlin owns layout + rasterization (see TextRasterizer.kt); these
+// entry points move the model and the coverage bitmaps across. Adds /
+// edits / removes are queued and drained on the GL thread by
+// applyPendingShapes (undo entries are pushed there). Getters read the
+// live layer lists from the UI thread — the same accepted race the
+// selection code already runs.
+
+namespace {
+
+std::string jbytesToString(JNIEnv* env, jbyteArray arr) {
+    if (!arr) return {};
+    jsize n = env->GetArrayLength(arr);
+    std::string out(static_cast<size_t>(n), '\0');
+    if (n) env->GetByteArrayRegion(arr, 0, n, reinterpret_cast<jbyte*>(&out[0]));
+    return out;
+}
+
+std::string jstringToString(JNIEnv* env, jstring js) {
+    if (!js) return {};
+    const char* c = env->GetStringUTFChars(js, nullptr);
+    std::string out = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(js, c);
+    return out;
+}
+
+jbyteArray stringToJbytes(JNIEnv* env, const std::string& str) {
+    jbyteArray arr = env->NewByteArray(static_cast<jsize>(str.size()));
+    if (!str.empty()) {
+        env->SetByteArrayRegion(arr, 0, static_cast<jsize>(str.size()),
+                                reinterpret_cast<const jbyte*>(str.data()));
+    }
+    return arr;
+}
+
+}  // namespace
+
+// Create a provisional text box on the active layer at the given
+// unrotated top-left. Returns the new id. Colour is the current brush
+// colour. The box has no text yet; the first non-empty updateTextBox
+// is what enters the undo history.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_addTextBox(
+        JNIEnv* env, jobject,
+        jfloat x, jfloat y, jfloat w, jboolean autoWidth,
+        jstring fontKey, jfloat fontSize, jboolean bold, jboolean italic,
+        jint align, jfloat lineSpacing) {
+    TextBox t;
+    t.id = newTextBoxId();
+    t.x = x; t.y = y;
+    t.w = std::max((float)w, kTextMinWidth);
+    t.h = std::max((float)fontSize * 1.3f, 1.0f);
+    t.rotation = 0.0f;
+    t.color = g_currentBrushColor.load();
+    t.fontSize = fontSize;
+    t.lineSpacing = lineSpacing;
+    t.bold = bold ? 1 : 0;
+    t.italic = italic ? 1 : 0;
+    t.align = static_cast<uint8_t>(std::max(0, std::min(2, (int)align)));
+    t.autoWidth = autoWidth ? 1 : 0;
+    t.fontKey = jstringToString(env, fontKey);
+    const uint32_t id = t.id;
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingTextAdds.push_back(std::move(t));
+    return static_cast<jint>(id);
+}
+
+// Replace a box's whole state. `undoable` = true for user edits
+// (commit from the editor, style changes); false for layout-only
+// follow-ups (height after a re-wrap) that ride on another entry.
+// `textUtf8` is raw UTF-8 bytes — JNI's modified-UTF-8 jstring path
+// mangles supplementary characters.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_updateTextBox(
+        JNIEnv* env, jobject,
+        jint id, jbyteArray textUtf8, jstring fontKey, jfloat fontSize,
+        jboolean bold, jboolean italic, jint align, jfloat lineSpacing,
+        jint color, jfloat x, jfloat y, jfloat w, jfloat h,
+        jfloat rotation, jboolean autoWidth, jboolean undoable,
+        jintArray runsFlat) {
+    PendingTextEdit pe;
+    pe.undoable = undoable == JNI_TRUE;
+    TextBox& t = pe.box;
+    t.id = static_cast<uint32_t>(id);
+    t.text = jbytesToString(env, textUtf8);
+    // Runs arrive flattened: [start, end, flags, color] per run.
+    if (runsFlat) {
+        jsize n = env->GetArrayLength(runsFlat);
+        std::vector<jint> buf(static_cast<size_t>(n));
+        if (n) env->GetIntArrayRegion(runsFlat, 0, n, buf.data());
+        for (jsize i = 0; i + 3 < n; i += 4) {
+            TextRun r;
+            r.start = static_cast<uint32_t>(std::max(0, buf[i]));
+            r.end   = static_cast<uint32_t>(std::max(0, buf[i + 1]));
+            r.flags = static_cast<uint8_t>(buf[i + 2] & 0xFF);
+            r.color = static_cast<uint32_t>(buf[i + 3]) & 0x00FFFFFFu;
+            if (r.end > r.start) t.runs.push_back(r);
+        }
+    }
+    t.fontKey = jstringToString(env, fontKey);
+    t.fontSize = fontSize;
+    t.bold = bold ? 1 : 0;
+    t.italic = italic ? 1 : 0;
+    t.align = static_cast<uint8_t>(std::max(0, std::min(2, (int)align)));
+    t.lineSpacing = lineSpacing;
+    t.color = static_cast<uint32_t>(color) & 0x00FFFFFFu;
+    t.x = x; t.y = y;
+    t.w = std::max((float)w, kTextMinWidth);
+    t.h = std::max((float)h, 1.0f);
+    t.rotation = rotation;
+    t.autoWidth = autoWidth ? 1 : 0;
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingTextEdits.push_back(std::move(pe));
+}
+
+// Remove a box. Empty boxes vanish without an undo entry (an abandoned
+// provisional box); non-empty ones push VectorDelete.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_removeTextBox(JNIEnv*, jobject, jint id) {
+    std::lock_guard<std::mutex> lock(g_pendingShapesMutex);
+    g_pendingTextRemoves.push_back(static_cast<uint32_t>(id));
+}
+
+// Hand over a coverage bitmap (w*h bytes, row 0 = top) rendered at
+// `scale` texels per doc px. Uploaded on the GL thread next frame.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_uploadTextRaster(
+        JNIEnv* env, jobject, jint id, jfloat scale, jint w, jint h,
+        jbyteArray alpha, jint channels) {
+    if (!alpha || w <= 0 || h <= 0 || w > kTextRasterMaxDim * 2
+        || h > kTextRasterMaxDim * 2) return JNI_FALSE;
+    if (channels != 1 && channels != 4) return JNI_FALSE;
+    jsize n = env->GetArrayLength(alpha);
+    if (n != w * h * channels) return JNI_FALSE;
+    PendingTextRaster p;
+    p.id = static_cast<uint32_t>(id);
+    p.w = w; p.h = h; p.scale = scale;
+    p.channels = channels;
+    p.alpha.resize(static_cast<size_t>(n));
+    env->GetByteArrayRegion(alpha, 0, n, reinterpret_cast<jbyte*>(p.alpha.data()));
+    {
+        std::lock_guard<std::mutex> lock(g_pendingTextRasterMutex);
+        // Coalesce: a newer raster for the same id supersedes a queued one.
+        g_pendingTextRasters.erase(
+            std::remove_if(g_pendingTextRasters.begin(), g_pendingTextRasters.end(),
+                           [&](const PendingTextRaster& q) { return q.id == p.id; }),
+            g_pendingTextRasters.end());
+        g_pendingTextRasters.push_back(std::move(p));
+    }
+    return JNI_TRUE;
+}
+
+// One-shot flag the compositor raises when some box on screen has no
+// raster or a stale-scale one. Kotlin polls after each multi-buffer
+// render and answers with getTextRasterRequests.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_textRasterNeeded(JNIEnv*, jobject) {
+    return g_textRasterNeeded.exchange(0) ? JNI_TRUE : JNI_FALSE;
+}
+
+// [id, desiredScale] pairs for every box on the active page whose
+// raster is missing or more than kTextRasterBand away from the scale
+// the given view scale wants. Ids are < 2^24 so they survive the
+// float round-trip.
+JNIEXPORT jfloatArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getTextRasterRequests(
+        JNIEnv* env, jobject, jfloat viewScale) {
+    std::vector<float> out;
+    std::unordered_map<uint32_t, TextRasterInfo> have;
+    {
+        std::lock_guard<std::mutex> lock(g_textRasterScaleMutex);
+        have = g_textRasterScales;
+    }
+    auto& ls = layers();
+    for (auto& lp : ls) {
+        if (!lp) continue;
+        for (const auto& t : lp->texts) {
+            float want = desiredTextRasterScale(viewScale, t.w, t.h);
+            auto it = have.find(t.id);
+            bool need = (it == have.end());
+            if (!need) {
+                need = textRasterStale(it->second.scale, it->second.docW, want, t.w);
+            }
+            if (need) {
+                out.push_back(static_cast<float>(t.id));
+                out.push_back(want);
+            }
+        }
+    }
+    jfloatArray arr = env->NewFloatArray(static_cast<jsize>(out.size()));
+    if (!out.empty()) env->SetFloatArrayRegion(arr, 0, static_cast<jsize>(out.size()), out.data());
+    return arr;
+}
+
+// Numeric fields of a box: [x, y, w, h, rotation, color, fontSize,
+// bold, italic, align, lineSpacing, autoWidth, layerIdx]. Null if the
+// id isn't on the active page (or is still queued).
+JNIEXPORT jfloatArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getTextBoxNumeric(JNIEnv* env, jobject, jint id) {
+    size_t li = 0;
+    TextBox* t = findTextBoxById(static_cast<uint32_t>(id), &li, nullptr);
+    if (!t) return nullptr;
+    float v[13] = { t->x, t->y, t->w, t->h, t->rotation,
+                    static_cast<float>(t->color), t->fontSize,
+                    static_cast<float>(t->bold), static_cast<float>(t->italic),
+                    static_cast<float>(t->align), t->lineSpacing,
+                    static_cast<float>(t->autoWidth), static_cast<float>(li) };
+    jfloatArray arr = env->NewFloatArray(13);
+    env->SetFloatArrayRegion(arr, 0, 13, v);
+    return arr;
+}
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getTextBoxText(JNIEnv* env, jobject, jint id) {
+    TextBox* t = findTextBoxById(static_cast<uint32_t>(id), nullptr, nullptr);
+    if (!t) return nullptr;
+    return stringToJbytes(env, t->text);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_bk_drawing_NativeRenderer_getTextBoxFont(JNIEnv* env, jobject, jint id) {
+    TextBox* t = findTextBoxById(static_cast<uint32_t>(id), nullptr, nullptr);
+    if (!t) return nullptr;
+    return env->NewStringUTF(t->fontKey.c_str());
+}
+
+namespace {
+jintArray runsToJint(JNIEnv* env, const std::vector<TextRun>& runs) {
+    std::vector<jint> out;
+    out.reserve(runs.size() * 4);
+    for (const auto& r : runs) {
+        out.push_back(static_cast<jint>(r.start));
+        out.push_back(static_cast<jint>(r.end));
+        out.push_back(static_cast<jint>(r.flags));
+        out.push_back(static_cast<jint>(r.color));
+    }
+    jintArray arr = env->NewIntArray(static_cast<jsize>(out.size()));
+    if (!out.empty()) env->SetIntArrayRegion(arr, 0, static_cast<jsize>(out.size()), out.data());
+    return arr;
+}
+}  // namespace
+
+// Style runs of a box, flattened [start, end, flags, color] per run.
+JNIEXPORT jintArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getTextBoxRuns(JNIEnv* env, jobject, jint id) {
+    TextBox* t = findTextBoxById(static_cast<uint32_t>(id), nullptr, nullptr);
+    if (!t) return nullptr;
+    return runsToJint(env, t->runs);
+}
+
+// Topmost text box on the active layer containing (x, y), or 0.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_hitTestTextBoxAt(JNIEnv*, jobject, jfloat x, jfloat y) {
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return 0;
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Vector) return 0;
+    float pad = hitThresholdPadDoc();
+    uint32_t hit = 0;
+    for (const auto& t : layer.texts) {
+        if (textBoxContains(t, x, y, pad)) hit = t.id;
+    }
+    return static_cast<jint>(hit);
+}
+
+// Box currently open in the edit overlay (0 = none). The compositor
+// skips it so the overlay is the only visual.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setTextEditing(JNIEnv*, jobject, jint id) {
+    g_textEditingId.store(static_cast<uint32_t>(id));
+    g_mbCacheValid = false;
+}
+
+// Id of the primary selection if it is a text box, else 0.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getSelectedTextBoxId(JNIEnv*, jobject) {
+    Selection sel;
+    {
+        std::lock_guard<std::mutex> lock(g_selectionMutex);
+        sel = g_selection;
+    }
+    if (sel.kind != ShapeKind::Text) return 0;
+    if (sel.layerIdx >= layers().size() || !layers()[sel.layerIdx]) return 0;
+    const Layer& layer = *layers()[sel.layerIdx];
+    if (sel.shapeIdx >= layer.texts.size()) return 0;
+    return static_cast<jint>(layer.texts[sel.shapeIdx].id);
+}
+
+// PDF export: leave text boxes out of the composite (Kotlin draws
+// them as real PDF text). Cleared by Kotlin when the export finishes.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setExportSkipText(JNIEnv*, jobject, jboolean skip) {
+    g_exportSkipText.store(skip ? 1 : 0);
+    g_mbCacheValid = false;
+}
+
+// Every text box on [pageIdx] in layer z-order (bottom-up), 15 floats
+// each: [id, x, y, w, h, rotation, color, fontSize, bold, italic,
+// align, lineSpacing, autoWidth, layerVisible, layerOpacity]. Empty if
+// the page isn't loaded yet — the export render loads it first.
+JNIEXPORT jfloatArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageTextBoxes(JNIEnv* env, jobject, jint pageIdx) {
+    std::vector<float> out;
+    if (pageIdx >= 0 && static_cast<size_t>(pageIdx) < g_pages.size()
+        && g_pages[pageIdx] && g_pages[pageIdx]->contentLoaded) {
+        for (auto& lp : g_pages[pageIdx]->layers) {
+            if (!lp) continue;
+            float vis = lp->visible.load(std::memory_order_relaxed) ? 1.0f : 0.0f;
+            float op  = lp->opacity.load(std::memory_order_relaxed);
+            for (const auto& t : lp->texts) {
+                float v[15] = { static_cast<float>(t.id), t.x, t.y, t.w, t.h, t.rotation,
+                                static_cast<float>(t.color), t.fontSize,
+                                static_cast<float>(t.bold), static_cast<float>(t.italic),
+                                static_cast<float>(t.align), t.lineSpacing,
+                                static_cast<float>(t.autoWidth), vis, op };
+                out.insert(out.end(), v, v + 15);
+            }
+        }
+    }
+    jfloatArray arr = env->NewFloatArray(static_cast<jsize>(out.size()));
+    if (!out.empty()) env->SetFloatArrayRegion(arr, 0, static_cast<jsize>(out.size()), out.data());
+    return arr;
+}
+
+namespace {
+const TextBox* findTextBoxOnPage(jint pageIdx, uint32_t id) {
+    if (pageIdx < 0 || static_cast<size_t>(pageIdx) >= g_pages.size() || !g_pages[pageIdx]) return nullptr;
+    for (auto& lp : g_pages[pageIdx]->layers) {
+        if (!lp) continue;
+        for (const auto& t : lp->texts) if (t.id == id) return &t;
+    }
+    return nullptr;
+}
+}  // namespace
+
+JNIEXPORT jbyteArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageTextBoxText(JNIEnv* env, jobject, jint pageIdx, jint id) {
+    const TextBox* t = findTextBoxOnPage(pageIdx, static_cast<uint32_t>(id));
+    if (!t) return nullptr;
+    return stringToJbytes(env, t->text);
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageTextBoxFont(JNIEnv* env, jobject, jint pageIdx, jint id) {
+    const TextBox* t = findTextBoxOnPage(pageIdx, static_cast<uint32_t>(id));
+    if (!t) return nullptr;
+    return env->NewStringUTF(t->fontKey.c_str());
+}
+
+JNIEXPORT jintArray JNICALL
+Java_com_bk_drawing_NativeRenderer_getPageTextBoxRuns(JNIEnv* env, jobject, jint pageIdx, jint id) {
+    const TextBox* t = findTextBoxOnPage(pageIdx, static_cast<uint32_t>(id));
+    if (!t) return nullptr;
+    return runsToJint(env, t->runs);
+}
+
+// Make the given box the single selection (0 clears). Used after the
+// editor commits so the box shows its handles.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_selectTextBox(JNIEnv*, jobject, jint id) {
+    size_t li = 0, idx = 0;
+    TextBox* t = (id != 0) ? findTextBoxById(static_cast<uint32_t>(id), &li, &idx) : nullptr;
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    g_extraSelections.clear();
+    if (!t) { g_selection = Selection{}; return; }
+    g_selection.kind = ShapeKind::Text;
+    g_selection.layerIdx = li;
+    g_selection.shapeIdx = idx;
 }
 
 JNIEXPORT void JNICALL
@@ -10815,6 +11878,12 @@ void translateShape(Layer& layer, const Selection& sel, float dx, float dy) {
                 c.cx += dx; c.cy += dy;
             }
             break;
+        case ShapeKind::Text:
+            if (sel.shapeIdx < layer.texts.size()) {
+                auto& t = layer.texts[sel.shapeIdx];
+                t.x += dx; t.y += dy;
+            }
+            break;
         case ShapeKind::None:
             break;
     }
@@ -10981,6 +12050,27 @@ void applyScaleTo(float x, float y) {
     if (newHh < 0.5f) newHh = 0.5f;
 
     switch (sel.kind) {
+        case ShapeKind::Text:
+            // Width-only: a text box resize re-wraps the text (Kotlin
+            // re-lays-out on the width change) and never scales the
+            // font. Height is content-driven, so the dragged handle
+            // only moves along the box's local x; the opposite corner
+            // stays put.
+            if (sel.shapeIdx < layer.texts.size()) {
+                auto& t = layer.texts[sel.shapeIdx];
+                float newW = std::max(newHw * 2.0f, kTextMinWidth);
+                int anchorIdx = (d.handleIdx + 2) % 4;
+                float alx = (anchorIdx == 0 || anchorIdx == 3) ? -newW * 0.5f : +newW * 0.5f;
+                float aly = (anchorIdx == 0 || anchorIdx == 1) ? -t.h * 0.5f : +t.h * 0.5f;
+                float c2 = std::cos(t.rotation), s2 = std::sin(t.rotation);
+                float cx = d.anchorX - (alx * c2 - aly * s2);
+                float cy = d.anchorY - (alx * s2 + aly * c2);
+                t.w = newW;
+                t.autoWidth = 0;
+                t.x = cx - t.w * 0.5f;
+                t.y = cy - t.h * 0.5f;
+            }
+            break;
         case ShapeKind::Rect:
             if (sel.shapeIdx < layer.rects.size()) {
                 auto& r = layer.rects[sel.shapeIdx];
@@ -11091,6 +12181,11 @@ void applyRotateTo(float x, float y) {
                 rot(d.initialLine.x1, d.initialLine.y1, l.x1, l.y1);
             }
             break;
+        case ShapeKind::Text:
+            if (sel.shapeIdx < layer.texts.size()) {
+                layer.texts[sel.shapeIdx].rotation = newRotation;
+            }
+            break;
         case ShapeKind::Circle:
         case ShapeKind::None:
             break;
@@ -11189,6 +12284,11 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
             ShapeData sd; sd.kind = ShapeKind::Circle; sd.circle = layer.circles[i];
             if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
                 add(ShapeKind::Circle, i);
+        }
+        for (size_t i = 0; i < layer.texts.size(); ++i) {
+            ShapeData sd; sd.kind = ShapeKind::Text; sd.text = layer.texts[i];
+            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
+                add(ShapeKind::Text, i);
         }
         std::lock_guard<std::mutex> lock(g_selectionMutex);
         if (hits.empty()) {
@@ -11959,6 +13059,9 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
         std::memcpy(&bits, &s, sizeof(bits));
         g_viewScaleBits.store(bits);
     }
+    // Not the user's zoom: don't let the text compositor ask Kotlin
+    // for rasters at thumbnail scale.
+    g_suppressTextRasterRequests = true;
 
     // Cached thumbnail FBO + color attachment (resized when dimensions
     // change). Static is fine — only used from the GL thread.
@@ -12013,6 +13116,7 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     // Restore caller state.
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
     g_viewScaleBits.store(savedScaleBits);
+    g_suppressTextRasterRequests = false;
     g_activePageIdx = savedPage;
 }
 

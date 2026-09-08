@@ -147,6 +147,10 @@ enum class Tool(val nativeId: Int) {
     RECTANGLE  (3),
     CIRCLE     (4),
     ELLIPSE    (5),
+    // Text boxes on vector layers. Tap places an auto-width box, drag
+    // places a fixed-width one, tap on a box edits it. No native tool
+    // id — placement / editing go through TextEditController.
+    TEXT       (-1),
     SELECT     (6),
     SELECT_RECT (-1),    // raster rectangle marquee; no native tool id
     SELECT_LASSO(-1),    // raster freeform marquee; no native tool id
@@ -314,6 +318,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 bufferInfo.width, bufferInfo.height,
                 composed
             )
+            // Text boxes whose raster is missing (fresh load, undo,
+            // paste) or stale for this zoom get re-rasterized on the
+            // UI thread; the upload lands on the next pass.
+            if (NativeRenderer.textRasterNeeded()) {
+                post { onTextRasterNeeded?.invoke() }
+            }
             // Refresh page thumbnails for the sidebar. By default we only
             // re-render the ACTIVE page (the only one whose pixels can
             // have changed since the last multi-buffer pass under normal
@@ -661,6 +671,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         }
         NativeRenderer.setViewScale(viewScale)
         forceRedraw()
+        onViewTransformChanged?.invoke()
     }
 
     // Shape-tool drag state (doc-pixels, post-snap). Shared by Line,
@@ -684,6 +695,46 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  the stylus side-button). MainActivity uses this to refresh the
      *  on-screen tool button label. */
     var onToolChanged: ((Tool) -> Unit)? = null
+
+    // ---- Text tool hooks (see TextEditController) ----------------------
+    /** TEXT tool released on empty canvas: (docX, docY, width, autoWidth). */
+    var onTextPlaceRequested: ((Float, Float, Float, Boolean) -> Unit)? = null
+    /** TEXT tool tapped an existing box: its id. */
+    var onTextEditRequested: ((Int) -> Unit)? = null
+    /** The last composite found a text box with no / stale raster. */
+    var onTextRasterNeeded: (() -> Unit)? = null
+    /** View scale / rotation / pan changed (gesture or reset). */
+    var onViewTransformChanged: (() -> Unit)? = null
+    /** Any single-pointer DOWN reaching the tool dispatch. Return true
+     *  to consume the whole gesture (DOWN through UP): the text editor
+     *  does this when a tap outside the open box closes it, so the
+     *  same tap doesn't also start a new box — like Esc on a desktop. */
+    var onCanvasTouchDown: (() -> Boolean)? = null
+    private var swallowGestureUntilUp = false
+
+    /** Vector selection may have changed (tap / marquee / drag end). */
+    var onSelectionChanged: (() -> Unit)? = null
+
+    val currentViewRotation: Float get() = viewRotation
+    val isGestureActive: Boolean get() = gestureActive
+
+    /** Doc-px point at the centre of the visible canvas (excluding the
+     *  panel overlay on the left). */
+    fun viewCenterDoc(): Pair<Float, Float> {
+        val vx = visibleLeftInset + (width - visibleLeftInset) * 0.5f
+        val vy = height * 0.5f
+        val out = FloatArray(2)
+        viewToDoc(vx, vy, out)
+        return Pair(out[0], out[1])
+    }
+
+    /** Convert a doc-pixel coordinate to view pixels (inverse of viewToDoc). */
+    fun docToView(dx: Float, dy: Float, out: FloatArray) {
+        val c = cos(viewRotation)
+        val s = sin(viewRotation)
+        out[0] = viewPanX + viewScale * (c * dx - s * dy)
+        out[1] = viewPanY + viewScale * (s * dx + c * dy)
+    }
 
     /** Snapshot the active floating raster selection's pixels into the
      *  native clipboard. Selection is left unchanged. Queued onto the
@@ -735,6 +786,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
         pendingPasteSel = true
         forceRedraw()
     }
+
+    fun currentToolIs(tool: Tool): Boolean = currentTool == tool
 
     /** Switch directly to `tool`. Used by the tool-rail buttons. Same
      *  auto-commit-on-switch behavior as toggleTool, and notifies
@@ -1042,6 +1095,11 @@ class DrawingSurfaceView @JvmOverloads constructor(
             Tool.BUCKET -> {
                 // Click-to-act, nothing in flight to cancel.
             }
+            Tool.TEXT -> {
+                // Drop the drag-to-place preview; placement needs UP.
+                renderer?.commit()
+                textDragging = false
+            }
             Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE -> {
                 renderer?.commit()
                 p1Snapped = false
@@ -1113,9 +1171,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
         viewPanY     = newPanY
         NativeRenderer.setViewScale(viewScale)
         forceRedraw()
+        onViewTransformChanged?.invoke()
     }
 
     private companion object {
+        /** View-px the pen must travel before a TEXT tap becomes a
+         *  drag-to-place. */
+        const val kTextDragSlopPx = 14f
         // Limits on the gesture-driven view scale.
         const val kMinViewScale = 0.25f
         const val kMaxViewScale = 8.0f
@@ -1242,9 +1304,20 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
             return true
         }
+        if (swallowGestureUntilUp) {
+            if (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL) {
+                swallowGestureUntilUp = false
+            }
+            return true
+        }
+        if (action == MotionEvent.ACTION_DOWN && onCanvasTouchDown?.invoke() == true) {
+            swallowGestureUntilUp = true
+            return true
+        }
         return when (currentTool) {
             Tool.BRUSH, Tool.ERASER, Tool.SHADE -> handleStrokeEvent(r, event)
             Tool.BUCKET             -> handleBucketEvent(event)
+            Tool.TEXT               -> handleTextEvent(r, event)
             Tool.SELECT             -> handleSelectEvent(event)
             // The marquee/rectangle selection tool dispatches by active
             // layer type: raster → lift pixels into a floating raster
@@ -1593,13 +1666,20 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var selectMode = 0
     private var selectChanged = false   // true if we should persist on UP
 
+    // Text box that was the primary selection when the SELECT-tool
+    // DOWN landed. A tap (no drag) on it again opens the editor —
+    // first tap selects, second tap edits, like a slide deck.
+    private var selectDownTextId = 0
+
     private fun handleSelectEvent(event: MotionEvent): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                selectDownTextId = NativeRenderer.getSelectedTextBoxId()
                 viewToDoc(event.x, event.y, tmpDoc)
                 selectMode = NativeRenderer.beginInteractionAt(tmpDoc[0], tmpDoc[1])
                 selectChanged = false
                 forceRedraw()
+                onSelectionChanged?.invoke()
             }
             MotionEvent.ACTION_MOVE -> {
                 viewToDoc(event.x, event.y, tmpDoc)
@@ -1628,8 +1708,16 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 // Marquee finalization needs a redraw to clear the
                 // rect overlay + paint the new selection halos.
                 if (selectMode == 4) forceRedraw()
+                val tapOnSelected = selectMode == 1 && !selectChanged
+                    && event.actionMasked == MotionEvent.ACTION_UP
                 selectMode = 0
                 selectChanged = false
+                onSelectionChanged?.invoke()
+                if (tapOnSelected && selectDownTextId != 0
+                    && NativeRenderer.getSelectedTextBoxId() == selectDownTextId) {
+                    onTextEditRequested?.invoke(selectDownTextId)
+                }
+                selectDownTextId = 0
             }
         }
         return true
@@ -1779,6 +1867,79 @@ class DrawingSurfaceView @JvmOverloads constructor(
             p0y + (kotlin.math.sin(snappedAng) * dist).toFloat(),
             k,
         )
+    }
+
+    // TEXT tool drag state (doc px). textHitId is the box under the
+    // DOWN point, if any — a tap on it opens the editor.
+    private var textP0X = 0f
+    private var textP0Y = 0f
+    private var textP0ViewX = 0f
+    private var textP0ViewY = 0f
+    private var textCurX = 0f
+    private var textCurY = 0f
+    private var textDragging = false
+    private var textHitId = 0
+
+    /** TEXT tool: tap on a box → edit; tap on empty canvas → auto-width
+     *  box at the point; drag → fixed-width box spanning the drag's x
+     *  range (rectangle preview while dragging). Placement is snapped
+     *  like the shape tools so labels line up with the grid. */
+    private fun handleTextEvent(
+        r: GLFrontBufferedRenderer<StrokeAction>,
+        event: MotionEvent
+    ): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                viewToDoc(event.x, event.y, tmpDoc)
+                textHitId = NativeRenderer.hitTestTextBoxAt(tmpDoc[0], tmpDoc[1])
+                val (sx, sy) = if (textHitId == 0) snap(tmpDoc[0], tmpDoc[1])
+                               else Pair(tmpDoc[0], tmpDoc[1])
+                textP0X = sx; textP0Y = sy
+                textCurX = sx; textCurY = sy
+                textP0ViewX = event.x; textP0ViewY = event.y
+                textDragging = false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (textHitId != 0) return true
+                viewToDoc(event.x, event.y, tmpDoc)
+                val (sx, sy) = snap(tmpDoc[0], tmpDoc[1])
+                textCurX = sx; textCurY = sy
+                val dvx = event.x - textP0ViewX
+                val dvy = event.y - textP0ViewY
+                if (!textDragging && dvx * dvx + dvy * dvy > kTextDragSlopPx * kTextDragSlopPx) {
+                    textDragging = true
+                }
+                if (textDragging) {
+                    r.renderFrontBufferedLayer(
+                        StrokeAction.ShapePreview(1,
+                            textP0X, textP0Y, textCurX, textCurY, p1Snapped)
+                    )
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                if (textDragging) {
+                    r.commit()
+                    val x = minOf(textP0X, textCurX)
+                    val y = minOf(textP0Y, textCurY)
+                    val w = kotlin.math.abs(textCurX - textP0X)
+                    onTextPlaceRequested?.invoke(x, y, w, false)
+                } else if (textHitId != 0) {
+                    onTextEditRequested?.invoke(textHitId)
+                } else {
+                    onTextPlaceRequested?.invoke(textP0X, textP0Y, 0f, true)
+                }
+                textDragging = false
+                textHitId = 0
+                p1Snapped = false
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                if (textDragging) r.commit()
+                textDragging = false
+                textHitId = 0
+                p1Snapped = false
+            }
+        }
+        return true
     }
 
     private fun handleShapeEvent(

@@ -98,6 +98,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var strokeUniformAlphaRow: View
     private lateinit var brushHardRow: View
     private lateinit var brushPressRow: View
+    // TEXT panel rows (shown for the TEXT tool or a selected text box).
+    private lateinit var textFontRow: View
+    private lateinit var textSizeRow: View
+    private lateinit var textBoldRow: View
+    private lateinit var textItalicRow: View
+    private lateinit var textUnderlineRow: View
+    private lateinit var textAlignRow: View
+    private lateinit var textSpacingRow: View
+    private val textRowRefreshers = mutableListOf<() -> Unit>()
     private lateinit var bucketBleedRow: View
     private lateinit var colorChip: View
 
@@ -106,6 +115,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusDocText:   TextView
     private lateinit var statusGridText:    TextView
     private lateinit var statusMarginText:  TextView
+    private lateinit var textEditor: TextEditController
     private lateinit var statusPixelGridText: TextView
     private lateinit var statusSnapText:    TextView
     private lateinit var statusAngleText:   TextView
@@ -400,6 +410,27 @@ class MainActivity : AppCompatActivity() {
         }
         drawingView = canvas
 
+        // Text boxes: the edit overlay lives in bodyContainer on top of
+        // the canvas; the controller also answers native's raster
+        // requests. Wired after the canvas so the overlay stacks above
+        // it (and above the brush preview / panels added below — it's
+        // added to the container only while a box is being edited).
+        textEditor = TextEditController(this, bodyContainer, canvas).also { te ->
+            te.onNeedVectorLayer = { userAddVectorLayer() }
+        }
+        canvas.onTextPlaceRequested = { x, y, w, auto ->
+            textEditor.placeNew(x, y, w, auto, currentColorRgb)
+        }
+        canvas.onTextEditRequested  = { id -> textEditor.editExisting(id) }
+        canvas.onSelectionChanged   = { refreshTextPanel() }
+        textEditor.onStyleTargetChanged = { refreshTextPanel() }
+        textEditor.bindPrefs(prefs())
+        canvas.onTextRasterNeeded   = { textEditor.rasterizeRequested() }
+        canvas.onViewTransformChanged = { textEditor.reposition() }
+        // A tap outside an open text box only closes it; the next tap
+        // places a new one.
+        canvas.onCanvasTouchDown    = { textEditor.commitIfOpen() }
+
         // Brush preview overlay — sits ON TOP of the SurfaceView in
         // bodyContainer so its circle outline draws above the canvas.
         // isClickable/isFocusable are false in BrushPreviewView so
@@ -608,6 +639,7 @@ class MainActivity : AppCompatActivity() {
         rail.addView(makeRailToolTile(Tool.RECTANGLE,   R.drawable.ic_rect,          "rectangle"))
         rail.addView(makeRailToolTile(Tool.CIRCLE,      R.drawable.ic_circle,        "circle"))
         rail.addView(makeRailToolTile(Tool.ELLIPSE,     R.drawable.ic_ellipse,       "ellipse"))
+        rail.addView(makeRailToolTile(Tool.TEXT,        R.drawable.ic_text,          "text"))
 
         rail.addView(railRule())
         rail.addView(railSectionLabel("SELECT"))
@@ -731,6 +763,8 @@ class MainActivity : AppCompatActivity() {
     private fun onToolChanged(tool: Tool) {
         for ((t, tile) in railToolTiles) tile.isSelected = (t == tool)
         currentToolMirror = tool
+        // Leaving the text tool with the editor open commits the text.
+        if (tool != Tool.TEXT && ::textEditor.isInitialized) textEditor.commitIfOpen()
         if (::statusToolText.isInitialized) {
             statusToolText.text = "◇ ${tool.displayName.lowercase()}"
         }
@@ -755,6 +789,7 @@ class MainActivity : AppCompatActivity() {
             Tool.RECTANGLE    -> "rect"
             Tool.CIRCLE       -> "circle"
             Tool.ELLIPSE      -> "ellipse"
+            Tool.TEXT         -> "text"
             Tool.SELECT       -> "select"
             Tool.SELECT_RECT  -> "select"   // unified raster + vector
             Tool.SELECT_LASSO -> "lasso"
@@ -1411,9 +1446,219 @@ class MainActivity : AppCompatActivity() {
         bucketBleedRow = buildBucketBleedRow()
         container.addView(bucketBleedRow)
 
+        // TEXT rows — per-box style for the box being edited / selected,
+        // and the defaults for the next box. Hidden unless relevant.
+        textFontRow    = buildTextFontRow()
+        textSizeRow    = buildTextSizeRow()
+        textBoldRow      = buildTextCharToggleRow("bold", 0)
+        textItalicRow    = buildTextCharToggleRow("italic", 1)
+        textUnderlineRow = buildTextCharToggleRow("underline", 2)
+        textAlignRow   = buildTextAlignRow()
+        textSpacingRow = buildTextSpacingRow()
+        for (r in listOf(textFontRow, textSizeRow, textBoldRow, textItalicRow,
+                         textUnderlineRow, textAlignRow, textSpacingRow)) {
+            r.visibility = View.GONE
+            container.addView(r)
+        }
+
         // Push the initial value display.
         updateSizeSliderForTool()
         return container
+    }
+
+    // ---- TEXT panel rows ---------------------------------------------------
+
+    private fun textStyleModel(): TextBoxModel =
+        if (::textEditor.isInitialized) (textEditor.currentStyleBox() ?: textEditor.defaultsModel())
+        else TextBoxModel(0, 0f, 0f, 0f, 0f, 0f, 0, 24f, false, false, 0, 1f, true,
+                          FontRegistry.defaultKey, "", 0)
+
+    private fun applyTextStyle(mutate: (TextBoxModel) -> Unit) {
+        if (::textEditor.isInitialized) textEditor.applyStyleChange(mutate)
+        refreshTextPanel()
+        // A selected (not edited) box is updated through the GL queue,
+        // so native still reports the old values for a frame; refresh
+        // again once the edit has landed.
+        drawingView?.postDelayed({ refreshTextPanel() }, 80L)
+    }
+
+    /** Sync every TEXT row's widget to the current target / defaults
+     *  and show or hide the rows. */
+    private fun refreshTextPanel() {
+        if (!::textFontRow.isInitialized) return
+        val selectTool = currentToolMirror == Tool.SELECT
+            || currentToolMirror == Tool.SELECT_RECT
+            || currentToolMirror == Tool.SELECT_LASSO
+        val show = currentToolMirror == Tool.TEXT
+            || (selectTool && ::textEditor.isInitialized && textEditor.hasStyleTarget())
+        for (r in listOf(textFontRow, textSizeRow, textBoldRow, textItalicRow,
+                         textUnderlineRow, textAlignRow, textSpacingRow)) {
+            r.visibility = if (show) View.VISIBLE else View.GONE
+        }
+        if (!show && ::brushSectionHeader.isInitialized) {
+            brushSectionHeader.text = toolHeaderTitle()
+        }
+        if (show) {
+            for (f in textRowRefreshers) f()
+            if (::brushSectionHeader.isInitialized) brushSectionHeader.text = "TEXT"
+            // The brush rows don't apply while a text box is targeted.
+            if (::brushSizeRow.isInitialized && currentToolMirror != Tool.TEXT) {
+                brushSizeRow.visibility = View.GONE
+                brushAlphaRow.visibility = View.GONE
+                strokeUniformAlphaRow.visibility = View.GONE
+                brushHardRow.visibility = View.GONE
+                brushPressRow.visibility = View.GONE
+                bucketBleedRow.visibility = View.GONE
+            }
+        }
+    }
+
+    private fun textPanelLabel(text: String): TextView = TextView(this).apply {
+        this.text = text
+        typeface = fontMono ?: Typeface.MONOSPACE
+        textSize = 11f
+        setTextColor(getColor(R.color.inkSoft))
+    }
+
+    private fun textPanelValue(): TextView = TextView(this).apply {
+        typeface = fontMono ?: Typeface.MONOSPACE
+        textSize = 11f
+        setTextColor(getColor(R.color.ink))
+        gravity = Gravity.END
+    }
+
+    /** "font  ·  Inter" — tap opens a popup listing the registry. */
+    private fun buildTextFontRow(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 4.dp, 10.dp, 4.dp)
+            isClickable = true; isFocusable = true
+        }
+        val label = textPanelLabel("font")
+        val value = textPanelValue().apply { setTextColor(getColor(R.color.hot)) }
+        row.addView(label, LinearLayout.LayoutParams(36.dp, ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.addView(value, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        textRowRefreshers += { value.text = FontRegistry.entry(textStyleModel().fontKey).displayName }
+        row.setOnClickListener { anchor ->
+            val current = textStyleModel().fontKey
+            showPaperPopupMenu(anchor, FontRegistry.entries.map { e ->
+                PaperMenuItem((if (e.key == current) "• " else "  ") + e.displayName) {
+                    applyTextStyle { it.fontKey = e.key }
+                }
+            })
+        }
+        return row
+    }
+
+    private val kTextSizeMin = 6
+    private val kTextSizeMax = 144
+
+    private fun buildTextSizeRow(): View {
+        val label = textPanelLabel("size")
+        val value = textPanelValue()
+        val slider = SeekBar(this).apply {
+            max = kTextSizeMax - kTextSizeMin
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    val v = p + kTextSizeMin
+                    value.text = v.toString()
+                    if (!fromUser) return
+                    applyTextStyle { it.fontSize = v.toFloat() }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        textRowRefreshers += {
+            val v = textStyleModel().fontSize.toInt().coerceIn(kTextSizeMin, kTextSizeMax)
+            slider.progress = v - kTextSizeMin
+            value.text = v.toString()
+        }
+        return buildSliderRow(label, slider, value)
+    }
+
+    /** bold / italic / underline: per-character toggles. With a text
+     *  selection in the editor they act on the selection; otherwise on
+     *  the whole box. [flagIdx] indexes TextEditController.panelFlags. */
+    private fun buildTextCharToggleRow(name: String, flagIdx: Int): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 4.dp, 10.dp, 4.dp)
+            isClickable = true; isFocusable = false
+        }
+        val label = textPanelLabel(name)
+        val value = textPanelValue()
+        row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        row.addView(value, LinearLayout.LayoutParams(36.dp, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val current = {
+            if (::textEditor.isInitialized) textEditor.panelFlags()[flagIdx] else false
+        }
+        val refresh = {
+            val on = current()
+            value.text = if (on) "on" else "off"
+            value.setTextColor(getColor(if (on) R.color.hot else R.color.inkSoft))
+        }
+        textRowRefreshers += refresh
+        row.setOnClickListener {
+            if (!::textEditor.isInitialized) return@setOnClickListener
+            val next = !current()
+            textEditor.applyCharStyle { c ->
+                when (flagIdx) {
+                    0 -> c.bold = next
+                    1 -> c.italic = next
+                    else -> c.underline = next
+                }
+            }
+            refreshTextPanel()
+            drawingView?.postDelayed({ refreshTextPanel() }, 80L)
+        }
+        return row
+    }
+
+    private fun buildTextAlignRow(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 4.dp, 10.dp, 4.dp)
+            isClickable = true; isFocusable = true
+        }
+        val label = textPanelLabel("align")
+        val value = textPanelValue().apply { setTextColor(getColor(R.color.hot)) }
+        row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        row.addView(value, LinearLayout.LayoutParams(56.dp, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val names = listOf("left", "centre", "right")
+        textRowRefreshers += { value.text = names[textStyleModel().align.coerceIn(0, 2)] }
+        row.setOnClickListener {
+            val next = (textStyleModel().align + 1) % 3
+            applyTextStyle { it.align = next }
+        }
+        return row
+    }
+
+    private fun buildTextSpacingRow(): View {
+        val label = textPanelLabel("lead")
+        val value = textPanelValue()
+        val slider = SeekBar(this).apply {
+            max = 120   // 80% .. 200%
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                    val pct = p + 80
+                    value.text = "$pct%"
+                    if (!fromUser) return
+                    applyTextStyle { it.lineSpacing = pct / 100f }
+                }
+                override fun onStartTrackingTouch(sb: SeekBar?) {}
+                override fun onStopTrackingTouch(sb: SeekBar?) {}
+            })
+        }
+        textRowRefreshers += {
+            val pct = (textStyleModel().lineSpacing * 100f).toInt().coerceIn(80, 200)
+            slider.progress = pct - 80
+            value.text = "$pct%"
+        }
+        return buildSliderRow(label, slider, value)
     }
 
     private fun buildStrokeUniformAlphaRow(): View {
@@ -1638,6 +1883,16 @@ class MainActivity : AppCompatActivity() {
         gravity = Gravity.END
     }
 
+    private fun toolHeaderTitle(): String = when (currentToolMirror) {
+        Tool.ERASER                                              -> "ERASER"
+        Tool.BUCKET                                              -> "BUCKET"
+        Tool.SHADE                                               -> "SHADE"
+        Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE     -> "VECTOR"
+        Tool.SELECT, Tool.SELECT_RECT, Tool.SELECT_LASSO         -> "SELECT"
+        Tool.TEXT                                                -> "TEXT"
+        else                                                     -> "BRUSH"
+    }
+
     private fun currentToolEditsVector(): Boolean = when (currentToolMirror) {
         Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE -> true
         else -> false
@@ -1660,14 +1915,7 @@ class MainActivity : AppCompatActivity() {
         // drive each, but the wording shouldn't say "BRUSH" while the
         // user is editing a vector line width or eraser settings.
         if (::brushSectionHeader.isInitialized) {
-            brushSectionHeader.text = when (currentToolMirror) {
-                Tool.ERASER                                              -> "ERASER"
-                Tool.BUCKET                                              -> "BUCKET"
-                Tool.SHADE                                               -> "SHADE"
-                Tool.LINE, Tool.RECTANGLE, Tool.CIRCLE, Tool.ELLIPSE     -> "VECTOR"
-                Tool.SELECT, Tool.SELECT_RECT, Tool.SELECT_LASSO         -> "SELECT"
-                else                                                     -> "BRUSH"
-            }
+            brushSectionHeader.text = toolHeaderTitle()
         }
 
         // Hide slider rows that don't apply to the active tool. Only
@@ -1695,6 +1943,7 @@ class MainActivity : AppCompatActivity() {
             brushPressRow.visibility  = if (showPress)        View.VISIBLE else View.GONE
             bucketBleedRow.visibility = if (showBleed)        View.VISIBLE else View.GONE
         }
+        refreshTextPanel()
     }
 
     // The COLOR section follows the Design A "shared palette" layout:
@@ -1985,6 +2234,8 @@ class MainActivity : AppCompatActivity() {
             currentColorRgb  = masked
         }
         NativeRenderer.setBrushColor(currentColorRgb)
+        // A targeted text box (editing or selected) takes the colour.
+        if (::textEditor.isInitialized) textEditor.setColor(currentColorRgb)
         // Prepend to recents (dedup).
         recentColors.remove(currentColorRgb)
         recentColors.addFirst(currentColorRgb)
@@ -2023,6 +2274,8 @@ class MainActivity : AppCompatActivity() {
         currentColorRgb = previousColorRgb
         previousColorRgb = tmp
         NativeRenderer.setBrushColor(currentColorRgb)
+        // Same rule as setActiveColor: a targeted text box takes the colour.
+        if (::textEditor.isInitialized) textEditor.setColor(currentColorRgb)
         refreshColorUi()
     }
 
@@ -2279,6 +2532,7 @@ class MainActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
             isClickable = true; isFocusable = true
             setOnClickListener {
+                if (::textEditor.isInitialized) textEditor.commitIfOpen()
                 NativeRenderer.switchPage(idx)
                 drawingView?.forceRedraw()
             }
@@ -2806,9 +3060,9 @@ class MainActivity : AppCompatActivity() {
                                                                 { toggleStylusOnly() },
             PaperMenuItem("Delete selection")                   { userDeleteSelection() },
             PaperMenuItem("Rasterize selection to layer below") { userRasterizeSelectionBelow() },
-            PaperMenuItem("Cut")                                { drawingView?.queueCutSelection() },
-            PaperMenuItem("Copy")                               { drawingView?.queueCopySelection() },
-            PaperMenuItem("Paste")                              { drawingView?.queuePasteSelection() },
+            PaperMenuItem("Cut")                                { mirrorTextToSystemClipboard(); drawingView?.queueCutSelection() },
+            PaperMenuItem("Copy")                               { mirrorTextToSystemClipboard(); drawingView?.queueCopySelection() },
+            PaperMenuItem("Paste")                              { userPaste() },
         ))
     }
 
@@ -2969,11 +3223,26 @@ class MainActivity : AppCompatActivity() {
     /** Render the active page into a fresh bitmap on the GL thread,
      *  then write it to [uri] as a PNG. Failure → toast; the bitmap is
      *  always recycled. */
+    /** Letterbox factor the export composite applies to a page rendered
+     *  into a (w, h) bitmap: doc px → bitmap px, plus the centring
+     *  offsets. Mirrors renderPageThumbnail. */
+    private fun exportTransform(w: Int, h: Int): Triple<Float, Float, Float> {
+        val pw = NativeRenderer.getPageWidth().toFloat().coerceAtLeast(1f)
+        val ph = NativeRenderer.getPageHeight().toFloat().coerceAtLeast(1f)
+        val s = minOf(w / pw, h / ph)
+        return Triple(s, (w - s * pw) * 0.5f, (h - s * ph) * 0.5f)
+    }
+
     private fun exportActivePageToPng(uri: Uri) {
         val v = drawingView ?: return
         val (w, h) = computeExportDimensions()
         val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val pageIdx = NativeRenderer.getActivePage()
+        // Text boxes are rasterized at the export scale first so the
+        // PNG gets crisp text rather than the screen-resolution raster.
+        if (::textEditor.isInitialized) {
+            textEditor.prepareForPngExport(exportTransform(w, h).first)
+        }
         v.queueExportRender(
             listOf(DrawingSurfaceView.ExportPage(pageIdx, bitmap))
         ) {
@@ -3007,6 +3276,13 @@ class MainActivity : AppCompatActivity() {
         val renders = bitmaps.mapIndexed { i, b ->
             DrawingSurfaceView.ExportPage(i, b)
         }
+        // Text boxes go into the PDF as real text (selectable, sharp at
+        // any zoom): the page composites leave them out and we draw
+        // them onto each page canvas after its bitmap. They land above
+        // all raster content on the page — accepted trade-off.
+        if (::textEditor.isInitialized) textEditor.commitIfOpen()
+        NativeRenderer.setExportSkipText(true)
+        val (ts, tox, toy) = exportTransform(w, h)
         v.queueExportRender(renders) {
             try {
                 val pdf = android.graphics.pdf.PdfDocument()
@@ -3015,6 +3291,7 @@ class MainActivity : AppCompatActivity() {
                         .Builder(w, h, i + 1).create()
                     val page = pdf.startPage(info)
                     page.canvas.drawBitmap(bmp, 0f, 0f, null)
+                    TextLayout.drawPageTextToCanvas(this, page.canvas, i, ts, tox, toy)
                     pdf.finishPage(page)
                 }
                 contentResolver.openOutputStream(uri)?.use { os ->
@@ -3031,6 +3308,8 @@ class MainActivity : AppCompatActivity() {
                     android.widget.Toast.LENGTH_LONG).show()
             } finally {
                 bitmaps.forEach { it.recycle() }
+                NativeRenderer.setExportSkipText(false)
+                v.forceRedraw()
             }
         }
     }
@@ -3226,6 +3505,33 @@ class MainActivity : AppCompatActivity() {
         if (NativeRenderer.hasSelection() || NativeRenderer.hasRasterSelection()) {
             drawingView?.queueDeleteSelection()
         }
+    }
+
+    /** Copying / cutting a text box also puts its plain text on the
+     *  Android clipboard so it can go to other apps. */
+    private fun mirrorTextToSystemClipboard() {
+        if (!::textEditor.isInitialized) return
+        val text = textEditor.selectedText() ?: return
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("text", text))
+    }
+
+    /** Paste: the in-app clipboard wins (shapes, raster); otherwise
+     *  plain text from the Android clipboard becomes a new text box
+     *  centred on the visible canvas. */
+    private fun userPaste() {
+        if (NativeRenderer.getClipboardKind() != 0) {
+            drawingView?.queuePasteSelection()
+            return
+        }
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        val text = cm.primaryClip?.takeIf { it.itemCount > 0 }
+            ?.getItemAt(0)?.coerceToText(this)?.toString()
+        if (text.isNullOrBlank() || !::textEditor.isInitialized) return
+        if (drawingView?.let { it.currentToolIs(Tool.SELECT_RECT) } == false) {
+            drawingView?.setTool(Tool.SELECT_RECT)
+        }
+        textEditor.pasteText(text, currentColorRgb)
     }
 
     private fun toggleSnap() {
@@ -3757,6 +4063,7 @@ class MainActivity : AppCompatActivity() {
      *  their current surface dims written back as a self-heal step so
      *  every doc has a stable page rect from then on. */
     private fun switchToDocument(name: String, sizeOverride: Pair<Int, Int>? = null) {
+        if (::textEditor.isInitialized) textEditor.commitIfOpen()
         val dir = docDirFor(name).apply { mkdirs() }
         if (sizeOverride != null) {
             writePageSize(dir, sizeOverride.first, sizeOverride.second)

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Source Serif 4 (SIL OFL 1.1) — bundled static faces for text
+     boxes. See fonts_licenses/OFL_SourceSerif4.md. -->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font android:fontStyle="normal" android:fontWeight="400" android:font="@font/source_serif_regular" />
+    <font android:fontStyle="normal" android:fontWeight="700" android:font="@font/source_serif_bold" />
+    <font android:fontStyle="italic" android:fontWeight="400" android:font="@font/source_serif_italic" />
+    <font android:fontStyle="italic" android:fontWeight="700" android:font="@font/source_serif_bold_italic" />
+</font-family>

@@ -157,6 +157,74 @@ object NativeRenderer {
     external fun addEllipse  (x0: Float, y0: Float, x1: Float, y1: Float)
     external fun addCircle   (x0: Float, y0: Float, x1: Float, y1: Float)
 
+    // ---- Text boxes -----------------------------------------------------
+    // Kotlin owns layout and rasterization (TextRasterizer); native
+    // stores the model, draws the cached coverage texture, and treats a
+    // box like any other vector shape for selection / undo / clipboard.
+    // Text crosses the boundary as raw UTF-8 bytes (JNI's modified
+    // UTF-8 jstrings mangle emoji and other supplementary characters).
+
+    /** Create a provisional (empty) box on the active vector layer at
+     *  the unrotated top-left (x, y). Returns its id. Not in the undo
+     *  history until the first non-empty [updateTextBox]. */
+    external fun addTextBox(x: Float, y: Float, w: Float, autoWidth: Boolean,
+                            fontKey: String, fontSize: Float,
+                            bold: Boolean, italic: Boolean, align: Int,
+                            lineSpacing: Float): Int
+
+    /** Replace a box's whole state. [undoable] = true for user edits,
+     *  false for layout-only follow-ups (e.g. height after a re-wrap). */
+    external fun updateTextBox(id: Int, textUtf8: ByteArray, fontKey: String,
+                               fontSize: Float, bold: Boolean, italic: Boolean,
+                               align: Int, lineSpacing: Float, color: Int,
+                               x: Float, y: Float, w: Float, h: Float,
+                               rotation: Float, autoWidth: Boolean,
+                               undoable: Boolean, runs: IntArray)
+
+    /** Remove a box; an empty box leaves no undo entry. */
+    external fun removeTextBox(id: Int)
+
+    /** Hand over an 8-bit coverage bitmap (w*h bytes, row 0 = top)
+     *  rendered at [scale] texels per doc px. */
+    external fun uploadTextRaster(id: Int, scale: Float, w: Int, h: Int,
+                                  alpha: ByteArray, channels: Int): Boolean
+
+    /** Style runs, flattened [start, end, flags, color] per run (flags:
+     *  1 bold, 2 italic, 4 underline, 8 has colour). */
+    external fun getTextBoxRuns(id: Int): IntArray?
+    external fun getPageTextBoxRuns(pageIdx: Int, id: Int): IntArray?
+
+    /** One-shot: did the last composite find a box with no / stale raster? */
+    external fun textRasterNeeded(): Boolean
+
+    /** [id, desiredScale] pairs for boxes needing a raster at [viewScale]. */
+    external fun getTextRasterRequests(viewScale: Float): FloatArray
+
+    /** [x, y, w, h, rotation, color, fontSize, bold, italic, align,
+     *  lineSpacing, autoWidth, layerIdx], or null if unknown. */
+    external fun getTextBoxNumeric(id: Int): FloatArray?
+    external fun getTextBoxText(id: Int): ByteArray?
+    external fun getTextBoxFont(id: Int): String?
+
+    /** Topmost text box on the active layer under (x, y) in doc px, or 0. */
+    external fun hitTestTextBoxAt(x: Float, y: Float): Int
+
+    /** PDF export: leave text boxes out of the composite while set. */
+    external fun setExportSkipText(skip: Boolean)
+
+    /** Every text box on a page, 15 floats each (see renderer.cpp):
+     *  id, x, y, w, h, rotation, color, fontSize, bold, italic, align,
+     *  lineSpacing, autoWidth, layerVisible, layerOpacity. Empty until
+     *  the page's content has been loaded (an export render loads it). */
+    external fun getPageTextBoxes(pageIdx: Int): FloatArray
+    external fun getPageTextBoxText(pageIdx: Int, id: Int): ByteArray?
+    external fun getPageTextBoxFont(pageIdx: Int, id: Int): String?
+
+    /** Box open in the edit overlay (hidden from the compositor); 0 = none. */
+    external fun setTextEditing(id: Int)
+    external fun getSelectedTextBoxId(): Int
+    external fun selectTextBox(id: Int)
+
     /**
      * Live preview for the shape tools. shapeType:
      *   0 = line, 1 = rectangle, 2 = circle, 3 = ellipse
