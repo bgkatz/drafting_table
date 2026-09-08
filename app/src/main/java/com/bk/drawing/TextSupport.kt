@@ -36,6 +36,7 @@ object FontRegistry {
         FontEntry("inter",          "Inter",          R.font.family_inter),
         FontEntry("jetbrains_mono", "JetBrains Mono", R.font.family_jetbrains_mono),
         FontEntry("source_serif",   "Source Serif",   R.font.family_source_serif),
+        FontEntry("routed_gothic",  "Routed Gothic",  R.font.family_routed_gothic),
     )
     const val defaultKey = "inter"
 

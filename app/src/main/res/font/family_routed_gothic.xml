@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Routed Gothic (SIL OFL 1.1) — monoline drafting face traced from
+     Leroy lettering templates. Regular + italic; bold is synthesised.
+     See fonts_licenses/OFL_RoutedGothic.md. -->
+<font-family xmlns:android="http://schemas.android.com/apk/res/android">
+    <font android:fontStyle="normal" android:fontWeight="400" android:font="@font/routed_gothic_regular" />
+    <font android:fontStyle="italic" android:fontWeight="400" android:font="@font/routed_gothic_italic" />
+</font-family>

@@ -1334,7 +1334,12 @@ class MainActivity : AppCompatActivity() {
                 override fun onStopTrackingTouch(sb: SeekBar?) {}
             })
         }
-        return buildSliderRow(label, layerOpacitySlider, layerOpacityValue)
+        return buildSliderRow(label, layerOpacitySlider, layerOpacityValue) { v ->
+            val p = v.toInt().coerceIn(0, 100)
+            layerOpacitySlider.progress = p
+            NativeRenderer.setLayerOpacity(activeLayerIndex, p / 100f)
+            drawingView?.forceRedraw()
+        }
     }
 
     /** Push the native opacity value for the currently-active layer
@@ -1414,7 +1419,23 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
-        brushSizeRow = buildSliderRow(sizeSliderLabel, sizeSlider, sizeValueLabel)
+        brushSizeRow = buildSliderRow(sizeSliderLabel, sizeSlider, sizeValueLabel) { v ->
+            if (currentToolEditsVector()) {
+                val w = v.coerceIn(kVectorWidthMin, kVectorWidthMax)
+                vectorLineWidth = w
+                sizeSlider.progress = vectorWidthToProgress(w)
+                sizeValueLabel.text = "%.1f".format(w)
+                NativeRenderer.setVectorLineWidth(w)
+                prefs().edit().putFloat(kPrefVectorWidth, vectorLineWidth).apply()
+            } else {
+                val sc = v.coerceIn(kBrushSizeMin, kBrushSizeMax)
+                brushSizeScale = sc
+                sizeSlider.progress = brushScaleToProgress(sc)
+                sizeValueLabel.text = "%.2fx".format(sc)
+                NativeRenderer.setBrushSize(sc)
+                prefs().edit().putFloat(kPrefBrushSize, brushSizeScale).apply()
+            }
+        }
         container.addView(brushSizeRow)
 
         // α slider — controls brush opacity. Active for any tool, but
@@ -1575,7 +1596,11 @@ class MainActivity : AppCompatActivity() {
             slider.progress = v - kTextSizeMin
             value.text = v.toString()
         }
-        return buildSliderRow(label, slider, value)
+        return buildSliderRow(label, slider, value) { typed ->
+            val v = typed.toInt().coerceIn(kTextSizeMin, kTextSizeMax)
+            slider.progress = v - kTextSizeMin
+            applyTextStyle { it.fontSize = v.toFloat() }
+        }
     }
 
     /** bold / italic / underline: per-character toggles. With a text
@@ -1658,7 +1683,11 @@ class MainActivity : AppCompatActivity() {
             slider.progress = pct - 80
             value.text = "$pct%"
         }
-        return buildSliderRow(label, slider, value)
+        return buildSliderRow(label, slider, value) { typed ->
+            val pct = typed.toInt().coerceIn(80, 200)
+            slider.progress = pct - 80
+            applyTextStyle { it.lineSpacing = pct / 100f }
+        }
     }
 
     private fun buildStrokeUniformAlphaRow(): View {
@@ -1739,7 +1768,13 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
-        return buildSliderRow(label, slider, valueLabel)
+        return buildSliderRow(label, slider, valueLabel) { v ->
+            val p = v.toInt().coerceIn(0, 100)
+            slider.progress = p
+            brushAlpha = progressToBrushAlpha(p)
+            NativeRenderer.setBrushAlpha(brushAlpha)
+            prefs().edit().putFloat(kPrefBrushAlpha, brushAlpha).apply()
+        }
     }
 
     /** Bucket-only bleed slider — pixels to dilate the fill mask after
@@ -1775,7 +1810,13 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
-        return buildSliderRow(label, slider, valueLabel)
+        return buildSliderRow(label, slider, valueLabel) { v ->
+            val p = v.toInt().coerceIn(0, kBucketBleedMax)
+            slider.progress = p
+            bucketBleed = p
+            NativeRenderer.setBucketBleed(bucketBleed)
+            prefs().edit().putInt(kPrefBucketBleed, bucketBleed).apply()
+        }
     }
 
     private fun buildBrushPressureRow(): View {
@@ -1810,7 +1851,13 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
-        return buildSliderRow(label, slider, valueLabel)
+        return buildSliderRow(label, slider, valueLabel) { v ->
+            val p = v.toInt().coerceIn(0, 100)
+            slider.progress = p
+            brushPressureSaturation = p / 100f
+            drawingView?.brushPressureSaturation = brushPressureSaturation
+            prefs().edit().putFloat(kPrefBrushPressure, brushPressureSaturation).apply()
+        }
     }
 
     private fun buildBrushHardnessRow(): View {
@@ -1843,10 +1890,22 @@ class MainActivity : AppCompatActivity() {
                 }
             })
         }
-        return buildSliderRow(label, slider, valueLabel)
+        return buildSliderRow(label, slider, valueLabel) { v ->
+            val p = v.toInt().coerceIn(0, 100)
+            slider.progress = p
+            brushHardness = p / 100f
+            NativeRenderer.setBrushHardness(brushHardness)
+            prefs().edit().putFloat(kPrefBrushHardness, brushHardness).apply()
+        }
     }
 
-    private fun buildSliderRow(label: View, slider: View, valueLabel: View): View {
+    /** Label + slider + value. When [onTyped] is given, tapping the
+     *  value opens a numeric entry dialog and the typed number is
+     *  handed to it — the caller clamps, sets the slider, and applies,
+     *  since programmatic progress changes don't fire the fromUser
+     *  path. Repeatable values without hunting on a 100dp track. */
+    private fun buildSliderRow(label: View, slider: View, valueLabel: View,
+                               onTyped: ((Float) -> Unit)? = null): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1858,6 +1917,15 @@ class MainActivity : AppCompatActivity() {
             0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
         row.addView(valueLabel, LinearLayout.LayoutParams(36.dp,
             ViewGroup.LayoutParams.WRAP_CONTENT))
+        if (onTyped != null && valueLabel is TextView) {
+            // Generous vertical padding: the number is a small target.
+            valueLabel.setPadding(2.dp, 6.dp, 0, 6.dp)
+            valueLabel.isClickable = true
+            valueLabel.setOnClickListener {
+                promptSliderValue((label as? TextView)?.text?.toString() ?: "value",
+                                  valueLabel, onTyped)
+            }
+        }
         return row
     }
 
@@ -2999,11 +3067,25 @@ class MainActivity : AppCompatActivity() {
      *  [onConfirm] callback receives the trimmed text; the dialog is
      *  dismissed before [onConfirm] runs (matches the legacy
      *  AlertDialog flow). */
+    /** Numeric-entry dialog for a slider row: pre-filled with the
+     *  number currently shown (units stripped), decimal keypad, all
+     *  selected so typing replaces it. */
+    private fun promptSliderValue(title: String, valueLabel: TextView,
+                                  onTyped: (Float) -> Unit) {
+        val shown = valueLabel.text?.toString() ?: ""
+        val initial = Regex("[0-9]+(\\.[0-9]+)?").find(shown)?.value ?: ""
+        showPaperInputDialog(title, initial, hint = null, confirmLabel = "Set",
+                             numeric = true) { text ->
+            text.toFloatOrNull()?.let { onTyped(it) }
+        }
+    }
+
     private fun showPaperInputDialog(
         title: String,
         initial: String,
         hint: String? = null,
         confirmLabel: String = "OK",
+        numeric: Boolean = false,
         onConfirm: (String) -> Unit,
     ) {
         val pad = 18.dp
@@ -3030,6 +3112,11 @@ class MainActivity : AppCompatActivity() {
             backgroundTintList =
                 android.content.res.ColorStateList.valueOf(inkSoft)
             isSingleLine = true
+            if (numeric) {
+                inputType = android.text.InputType.TYPE_CLASS_NUMBER or
+                    android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
+                selectAll()
+            }
         }
         container.addView(input, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -3042,6 +3129,25 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT))
 
         val dialog = showPaperDialog(container)
+        // Open ready to type: focus the field, raise the keyboard, and
+        // (for numbers) keep the whole value selected so typing replaces
+        // it — no tap-then-delete dance.
+        dialog.window?.setSoftInputMode(
+            android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
+        input.requestFocus()
+        input.post {
+            if (numeric) input.selectAll()
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE)
+                as android.view.inputmethod.InputMethodManager
+            imm.showSoftInput(input, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT)
+        }
+        // Enter / the keypad's action key confirms.
+        input.setOnEditorActionListener { _, _, _ ->
+            val text = input.text.toString().trim()
+            dialog.dismiss()
+            onConfirm(text)
+            true
+        }
         cancelBtn.setOnClickListener  { dialog.dismiss() }
         confirmBtn.setOnClickListener {
             val text = input.text.toString().trim()
@@ -3782,7 +3888,15 @@ class MainActivity : AppCompatActivity() {
                     }
                 })
             }
-            container.addView(buildSliderRow(label, slider, valueLabel),
+            val row = buildSliderRow(label, slider, valueLabel) { typed ->
+                val v = typed.toInt().coerceIn(spec.min, spec.max)
+                slider.progress = v - spec.min
+                spec.set(v)
+                applyPageSetupToNative()
+                drawingView?.forceRedraw()
+                writePageSetup(docDirFor(currentDocName))
+            }
+            container.addView(row,
                 LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT))
