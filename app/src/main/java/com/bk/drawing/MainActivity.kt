@@ -105,6 +105,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusToolText:  TextView
     private lateinit var statusDocText:   TextView
     private lateinit var statusGridText:    TextView
+    private lateinit var statusMarginText:  TextView
     private lateinit var statusPixelGridText: TextView
     private lateinit var statusSnapText:    TextView
     private lateinit var statusAngleText:   TextView
@@ -139,7 +140,22 @@ class MainActivity : AppCompatActivity() {
     )
 
     // ---- App state mirrors ---------------------------------------------
+    private val kDefaultGridSpacing = 50
+    private val kGridSpacingMin     = 8
+    private val kGridSpacingMax     = 256
+    private val kDefaultMarginTop   = 96
+    private val kDefaultMarginSide  = 72
+    private val kMarginMax          = 400
     private var gridState = 0          // 0 = off, 1 = lines, 2 = dots
+    // Page setup — per-document, persisted in <docDir>/page_setup.txt
+    // (see loadPageSetup / writePageSetup). gridState is part of it so
+    // a doc set up as graph paper reopens as graph paper. Margins are
+    // rose rules inset from the page edge: across the top and bottom
+    // at marginTop, down each side at marginSide. All sizes are doc px.
+    private var gridSpacing    = kDefaultGridSpacing
+    private var marginsEnabled = false
+    private var marginTop      = kDefaultMarginTop
+    private var marginSide     = kDefaultMarginSide
     // Pixel-grid overlay (1-doc-pixel boundaries). Native self-gates on
     // zoom — only renders when view scale is high enough that pixel
     // boundaries are visibly distinct. Persists across launches.
@@ -2437,11 +2453,22 @@ class MainActivity : AppCompatActivity() {
         // grid/snap texts double as toggles. Tap to flip; the active
         // state colors them with the same hot accent the rail's active
         // tile uses, so they read as enabled at a glance.
-        statusGridText = makeStatusText("grid: off").apply {
+        statusGridText = makeStatusText(gridChipLabel()).apply {
             isClickable = true; isFocusable = true
             setOnClickListener { cycleGrid() }
+            // Long-press opens the spacing slider — config sits with
+            // the toggle so the two don't live on opposite screen edges.
+            setOnLongClickListener { showGridConfigPopup(this); true }
             setTextColor(getColor(
                 if (gridState != 0) R.color.hot else R.color.inkSoft))
+        }
+        // Margins — same tap-toggles / long-press-configures pattern.
+        statusMarginText = makeStatusText(marginChipLabel()).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { toggleMargins() }
+            setOnLongClickListener { showMarginConfigPopup(this); true }
+            setTextColor(getColor(
+                if (marginsEnabled) R.color.hot else R.color.inkSoft))
         }
         // Pixel grid — 1-doc-pixel boundaries on top of strokes. Native
         // self-gates on zoom so the chip can read "on" while no grid
@@ -2500,6 +2527,7 @@ class MainActivity : AppCompatActivity() {
         bar.addView(statusDocText,    statusItemLp())
         bar.addView(statusToolText,   statusItemLp())
         bar.addView(statusGridText,   statusItemLp())
+        bar.addView(statusMarginText, statusItemLp())
         bar.addView(statusPixelGridText, statusItemLp())
         bar.addView(statusSnapText,   statusItemLp())
         bar.addView(statusAngleText,  statusItemLp())
@@ -3310,27 +3338,169 @@ class MainActivity : AppCompatActivity() {
 
     private fun cycleGrid() {
         gridState = (gridState + 1) % 3
+        applyPageSetupToNative()
+        refreshPageSetupChips()
+        writePageSetup(docDirFor(currentDocName))
+        drawingView?.forceRedraw()
+    }
+
+    private fun toggleMargins() {
+        marginsEnabled = !marginsEnabled
+        applyPageSetupToNative()
+        refreshPageSetupChips()
+        writePageSetup(docDirFor(currentDocName))
+        drawingView?.forceRedraw()
+    }
+
+    private fun gridChipLabel() = when (gridState) {
+        0 -> "grid: off"; 1 -> "grid: lines"; else -> "grid: dots"
+    }
+    private fun marginChipLabel() =
+        if (marginsEnabled) "margins: on" else "margins: off"
+
+    /** Mirror the whole per-doc page setup into native. Called after
+     *  any field changes and after a document switch. */
+    private fun applyPageSetupToNative() {
         when (gridState) {
-            0 -> {
-                NativeRenderer.setGridEnabled(false)
-            }
-            1 -> {
-                NativeRenderer.setGridStyle(1)
-                NativeRenderer.setGridEnabled(true)
-            }
-            2 -> {
-                NativeRenderer.setGridStyle(2)
-                NativeRenderer.setGridEnabled(true)
-            }
+            0 -> NativeRenderer.setGridEnabled(false)
+            1 -> { NativeRenderer.setGridStyle(1); NativeRenderer.setGridEnabled(true) }
+            else -> { NativeRenderer.setGridStyle(2); NativeRenderer.setGridEnabled(true) }
         }
+        NativeRenderer.setGridSpacing(gridSpacing.toFloat())
+        NativeRenderer.setMarginsEnabled(marginsEnabled)
+        NativeRenderer.setMarginSizes(marginTop.toFloat(), marginSide.toFloat())
+    }
+
+    private fun refreshPageSetupChips() {
         if (::statusGridText.isInitialized) {
-            statusGridText.text = when (gridState) {
-                0 -> "grid: off"; 1 -> "grid: lines"; else -> "grid: dots"
-            }
+            statusGridText.text = gridChipLabel()
             statusGridText.setTextColor(getColor(
                 if (gridState != 0) R.color.hot else R.color.inkSoft))
         }
-        drawingView?.forceRedraw()
+        if (::statusMarginText.isInitialized) {
+            statusMarginText.text = marginChipLabel()
+            statusMarginText.setTextColor(getColor(
+                if (marginsEnabled) R.color.hot else R.color.inkSoft))
+        }
+    }
+
+    /** Long-press on the grid chip: one slider for the minor-line
+     *  spacing. Live — the canvas redraws as the thumb moves; the doc
+     *  file is written when the thumb lifts. */
+    private fun showGridConfigPopup(anchor: View) {
+        showPaperSliderPopup(anchor, "Grid", listOf(
+            PaperSliderSpec("size", kGridSpacingMin, kGridSpacingMax,
+                            get = { gridSpacing },
+                            set = { gridSpacing = it }),
+        ))
+    }
+
+    /** Long-press on the margins chip: top/bottom and side insets. Opening
+     *  the popup turns margins on if they're off, so the sliders have
+     *  something to show. */
+    private fun showMarginConfigPopup(anchor: View) {
+        if (!marginsEnabled) {
+            marginsEnabled = true
+            applyPageSetupToNative()
+            refreshPageSetupChips()
+            drawingView?.forceRedraw()
+        }
+        showPaperSliderPopup(anchor, "Margins", listOf(
+            PaperSliderSpec("top",  0, kMarginMax,
+                            get = { marginTop },
+                            set = { marginTop = it }),
+            PaperSliderSpec("side", 0, kMarginMax,
+                            get = { marginSide },
+                            set = { marginSide = it }),
+        ))
+    }
+
+    /** One slider row in a [showPaperSliderPopup]. [set] is called with
+     *  the new value on every user drag step. */
+    private class PaperSliderSpec(
+        val label: String,
+        val min: Int,
+        val max: Int,
+        val get: () -> Int,
+        val set: (Int) -> Unit,
+    )
+
+    /** Paper-styled popup of labelled sliders, anchored to a status
+     *  chip. Every drag step mirrors to native and redraws so the user
+     *  sees the result live; the per-doc file is written on thumb lift
+     *  (same cadence as the brush sliders' pref writes). */
+    private fun showPaperSliderPopup(
+        anchor: View, title: String, specs: List<PaperSliderSpec>,
+    ) {
+        val paper = getColor(R.color.paper)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(paper)
+            setPadding(14.dp, 12.dp, 14.dp, 8.dp)
+        }
+        container.addView(makePaperDialogTitle(title),
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = 6.dp })
+
+        for (spec in specs) {
+            val label = TextView(this).apply {
+                text = spec.label
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 11f
+                setTextColor(getColor(R.color.inkSoft))
+            }
+            val valueLabel = TextView(this).apply {
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 11f
+                setTextColor(getColor(R.color.ink))
+                gravity = Gravity.END
+                text = spec.get().toString()
+            }
+            val slider = SeekBar(this).apply {
+                max = spec.max - spec.min
+                progress = (spec.get() - spec.min).coerceIn(0, spec.max - spec.min)
+                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                    override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) {
+                        val v = p + spec.min
+                        valueLabel.text = v.toString()
+                        if (!fromUser) return
+                        spec.set(v)
+                        applyPageSetupToNative()
+                        drawingView?.forceRedraw()
+                    }
+                    override fun onStartTrackingTouch(sb: SeekBar?) {}
+                    override fun onStopTrackingTouch(sb: SeekBar?) {
+                        writePageSetup(docDirFor(currentDocName))
+                    }
+                })
+            }
+            container.addView(buildSliderRow(label, slider, valueLabel),
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+
+        val popup = android.widget.PopupWindow(
+            container, 280.dp, ViewGroup.LayoutParams.WRAP_CONTENT,
+            /*focusable=*/ true,
+        )
+        popup.setBackgroundDrawable(
+            android.graphics.drawable.ColorDrawable(paper))
+        popup.isOutsideTouchable = true
+        popup.elevation = 8.dp.toFloat()
+        // The chips live in the bottom status bar, so a plain drop-down
+        // lands off-screen (the framework doesn't flip a PopupWindow
+        // whose parent is the full-screen decor). Measure and shove it
+        // up by its own height plus the anchor's so it sits just above
+        // the chip.
+        container.measure(
+            View.MeasureSpec.makeMeasureSpec(280.dp, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED),
+        )
+        val yOff = -(anchor.height + container.measuredHeight + 6.dp)
+        popup.showAsDropDown(anchor, 0, yOff, Gravity.START)
     }
 
     private fun togglePixelGrid() {
@@ -3499,6 +3669,7 @@ class MainActivity : AppCompatActivity() {
         rememberDocName(initialDoc)
         val docDir = docDirFor(initialDoc).apply { mkdirs() }
         NativeRenderer.setDocumentDir(docDir.absolutePath)
+        loadPageSetup(docDir)
 
         drawingView?.post {
             syncLayerStateFromNative()
@@ -3604,6 +3775,7 @@ class MainActivity : AppCompatActivity() {
         NativeRenderer.setPageBounds(0f, 0f, size.first.toFloat(), size.second.toFloat())
         currentDocName = name
         rememberDocName(name)
+        loadPageSetup(dir)
         if (::statusDocText.isInitialized) statusDocText.text = "doc · $name"
         NativeRenderer.loadDocument(dir.absolutePath)
         drawingView?.forceRedraw()
@@ -3842,6 +4014,53 @@ class MainActivity : AppCompatActivity() {
         runCatching {
             java.io.File(dir, kPageSizeFile).writeText("${w}x${h}")
         }.onFailure { android.util.Log.e("DrawingApp", "writePageSize failed", it) }
+    }
+
+    /** Per-document page setup (grid state + spacing, margins) lives
+     *  in <docDir>/page_setup.txt as key=value lines. Unknown keys are
+     *  ignored and missing keys keep their current value, so the format
+     *  can grow without a migration. */
+    private val kPageSetupFile = "page_setup.txt"
+
+    /** Load [dir]'s page setup into the mirrors, push it to native, and
+     *  refresh the chips. A doc with no file (legacy, or freshly
+     *  created) inherits whatever setup is currently active — so a new
+     *  notebook starts out like the one you were just in — and gets the
+     *  file written so it's stable from then on. */
+    private fun loadPageSetup(dir: java.io.File) {
+        val f = java.io.File(dir, kPageSetupFile)
+        val text = if (f.exists()) runCatching { f.readText() }.getOrNull() else null
+        if (text != null) {
+            for (line in text.lines()) {
+                val eq = line.indexOf('=')
+                if (eq <= 0) continue
+                val key = line.substring(0, eq).trim()
+                val v = line.substring(eq + 1).trim()
+                when (key) {
+                    "grid"         -> v.toIntOrNull()?.let { gridState = it.coerceIn(0, 2) }
+                    "grid_spacing" -> v.toIntOrNull()?.let {
+                        gridSpacing = it.coerceIn(kGridSpacingMin, kGridSpacingMax) }
+                    "margins"      -> marginsEnabled = (v == "1" || v == "true")
+                    "margin_top"   -> v.toIntOrNull()?.let { marginTop = it.coerceIn(0, kMarginMax) }
+                    "margin_side"  -> v.toIntOrNull()?.let { marginSide = it.coerceIn(0, kMarginMax) }
+                }
+            }
+        } else {
+            writePageSetup(dir)
+        }
+        applyPageSetupToNative()
+        refreshPageSetupChips()
+    }
+
+    private fun writePageSetup(dir: java.io.File) {
+        runCatching {
+            java.io.File(dir, kPageSetupFile).writeText(
+                "grid=$gridState\n" +
+                "grid_spacing=$gridSpacing\n" +
+                "margins=${if (marginsEnabled) 1 else 0}\n" +
+                "margin_top=$marginTop\n" +
+                "margin_side=$marginSide\n")
+        }.onFailure { android.util.Log.e("DrawingApp", "writePageSetup failed", it) }
     }
 
     /** Called once, the first time the SurfaceView has dims. Reads the

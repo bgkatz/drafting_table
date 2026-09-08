@@ -469,6 +469,17 @@ object NativeRenderer {
      */
     external fun setGridEnabled(enabled: Boolean)
     external fun setGridStyle(style: Int)   // 1 = lines, 2 = dots
+    external fun setGridSpacing(spacingDocPx: Float)   // minor-line pitch; also the snap pitch
+
+    /**
+     * Page margins — rose rules inset from the page edge: across the
+     * top and bottom at [top] doc-px, down each side at [side] doc-px.
+     * Drawn in the page background with the grid (under the layers,
+     * included in exports). Per-document; MainActivity mirrors them
+     * from page_setup.txt on every doc switch.
+     */
+    external fun setMarginsEnabled(enabled: Boolean)
+    external fun setMarginSizes(top: Float, side: Float)
 
     /**
      * Per-pixel grid overlay. When enabled AND the view is zoomed

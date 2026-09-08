@@ -135,6 +135,10 @@ The doc is mathematically infinite, but `setPageBounds(x0, y0, x1, y1)` defines 
 
 Default page bounds = initial surface dimensions, set once from `onSizeChanged`.
 
+### Page setup (grid + margins)
+
+Grid on/off/style, grid spacing, and the margin rules are **per-document**, stored in `<docDir>/page_setup.txt` as `key=value` lines (`grid`, `grid_spacing`, `margins`, `margin_top`, `margin_side`) next to `page_size.txt`. `loadPageSetup` runs on every doc switch and at startup; a doc with no file inherits the currently active setup and gets the file written. Native mirrors are atomics (`g_gridSpacing`, `g_marginEnabled`, `g_marginTop/Side`) read at composite time; `g_gridSpacing` is also the grid-snap pitch. Margins are rose line segments (top/bottom share `margin_top`, left/right share `margin_side`) drawn right after the grid in both `compositeAllLayers` and the eraser-preview "below" snapshot, so they behave exactly like the grid (under the layers, exported). The status-bar chips toggle on tap and open a slider popup on long-press (`showPaperSliderPopup`).
+
 ### renderer.cpp navigation
 
 The file is single-TU and order-sensitive. When adding helpers, watch the forward-declaration block around line ~830 (`saveVectorLayer`, `loadVectorLayerShapes`, the tile-snapshot helpers, `applyUndo` / `applyRedo` / `applyPendingShapes`). The undo apply functions (`applyEntryReverse`/`Forward`/`applyUndo`/`applyRedo`) live near the bottom of the anonymous namespace so all their dependencies are defined.

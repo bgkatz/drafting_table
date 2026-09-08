@@ -1220,6 +1220,18 @@ bool        g_inited  = false;
 // internally, but the public setter only sends 1 (lines) or 2 (dots).
 std::atomic<int> g_gridEnabled{0};   // 0 = off, 1 = on
 std::atomic<int> g_gridStyle{1};     // 1 = lines, 2 = dots
+// Minor-line spacing in doc px. Per-document: Kotlin reads it from the
+// doc's page_setup.txt on switch and mirrors it here. Also the pitch
+// for grid-intersection snapping (findSnap).
+std::atomic<float> g_gridSpacing{50.0f};
+
+// Page margins — rose rules inset from the page edge: across the top
+// and bottom at g_marginTop doc-px, down each side at g_marginSide.
+// Drawn in the page background right after the grid (under the layers,
+// exported like the grid). Per-document like the grid spacing.
+std::atomic<int>   g_marginEnabled{0};
+std::atomic<float> g_marginTop{96.0f};
+std::atomic<float> g_marginSide{72.0f};
 
 // Pixel grid overlay — 1-buffer-pixel lines at every integer doc-px
 // boundary. Only renders when enabled AND view scale is at least
@@ -1335,7 +1347,6 @@ constexpr float    kSnapVelocityViewPx = 6.0f;
 constexpr uint32_t kSnapMarkerColor    = 0xFFC020u;       // amber
 constexpr float    kSnapMarkerRViewPx  = 9.0f;            // ring radius (view px)
 
-constexpr float kGridSpacing      = 50.0f;       // doc pixels between minor lines
 constexpr float kGridSubdivisions = 5.0f;        // major every Nth minor
 // Half-widths in doc pixels. Lines look fine at sub-pixel widths since they're
 // extended; isolated dots need to be chunkier to read.
@@ -1345,6 +1356,12 @@ constexpr float kGridMinorDotWidth  = 1.5f;
 constexpr float kGridMajorDotWidth  = 2.5f;
 constexpr float kGridMinorColor[4] = { 0.55f, 0.60f, 0.70f, 0.45f };  // straight RGBA
 constexpr float kGridMajorColor[4] = { 0.40f, 0.45f, 0.55f, 0.70f };
+
+// Margin rules. Width is in doc px (not view px) so the rules zoom and
+// export exactly like the grid lines rather than like UI chrome.
+constexpr uint32_t kMarginColor      = 0xD07A8Cu;   // muted notebook rose
+constexpr float    kMarginAlpha      = 0.75f;
+constexpr float    kMarginWidthDocPx = 2.0f;
 
 // Live eraser preview state. Two layer-stack snapshots and one coverage
 // map, all sized to the buffer dimensions and lazily (re)allocated.
@@ -3035,7 +3052,7 @@ void renderGridOverlay(JNIEnv* env, int width, int height,
 
     int style = g_gridStyle.load();
     glUniformMatrix4fv(g_grid.uInverseTransform, 1, GL_FALSE, invM);
-    glUniform1f(g_grid.uSpacing, kGridSpacing);
+    glUniform1f(g_grid.uSpacing, g_gridSpacing.load());
     glUniform1f(g_grid.uSubdivisions, kGridSubdivisions);
     glUniform1f(g_grid.uMinorWidth,
                 style == 2 ? kGridMinorDotWidth : kGridMinorLineWidth);
@@ -3046,6 +3063,56 @@ void renderGridOverlay(JNIEnv* env, int width, int height,
     glUniform1i(g_grid.uStyle, style);
 
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    glBindVertexArray(0);
+}
+
+// Page margin rules: a horizontal rule g_marginTop in from the top and
+// bottom edges, and a vertical rule g_marginSide in from each side
+// edge, all spanning the full page. Part of the page background like the grid — drawn
+// under the layers so strokes occlude them, and included in exports.
+// Requires active page bounds (the rules are inset from page edges);
+// a margin of 0 draws nothing on that edge rather than sitting on the
+// page outline.
+void renderMarginRules(JNIEnv* env, int width, int height,
+                       jfloatArray transform, const PageClip& pageClip) {
+    if (g_marginEnabled.load() == 0 || !pageClip.active) return;
+    const float top  = g_marginTop.load();
+    const float side = g_marginSide.load();
+    const float pageW = pageClip.maxX - pageClip.minX;
+    const float pageH = pageClip.maxY - pageClip.minY;
+
+    glViewport(0, 0, width, height);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glUseProgram(g_lineProg.program);
+    glBindVertexArray(g_quadVao);
+    uploadMat4(env, g_lineProg.uTransform, transform);
+    glUniform2f(g_lineProg.uScreen, (float)width, (float)height);
+    // uOpacity is per-layer state left behind by the vector compositor;
+    // reset it like the page outline does or a faint/hidden vector layer
+    // on the previous frame silently dims these.
+    glUniform1f(g_lineProg.uOpacity, 1.0f);
+    // Page-clipped: the rules live inside the page anyway, and the clip
+    // trims their round caps flush with the page edge.
+    uploadPageClip(g_lineProg.uPageMin, g_lineProg.uPageMax,
+                   g_lineProg.uPageActive, pageClip);
+
+    if (top > 0.0f && top * 2.0f < pageH) {
+        const float yt = pageClip.minY + top;
+        const float yb = pageClip.maxY - top;
+        drawLineSegment(pageClip.minX, yt, pageClip.maxX, yt,
+                        kMarginColor, kMarginWidthDocPx, kMarginAlpha);
+        drawLineSegment(pageClip.minX, yb, pageClip.maxX, yb,
+                        kMarginColor, kMarginWidthDocPx, kMarginAlpha);
+    }
+    if (side > 0.0f && side * 2.0f < pageW) {
+        const float xl = pageClip.minX + side;
+        const float xr = pageClip.maxX - side;
+        drawLineSegment(xl, pageClip.minY, xl, pageClip.maxY,
+                        kMarginColor, kMarginWidthDocPx, kMarginAlpha);
+        drawLineSegment(xr, pageClip.minY, xr, pageClip.maxY,
+                        kMarginColor, kMarginWidthDocPx, kMarginAlpha);
+    }
     glBindVertexArray(0);
 }
 
@@ -3162,6 +3229,8 @@ void renderLayerRangeIntoFbo(JNIEnv* env, ViewFbo& target,
         uploadPageClip(g_grid.uPageMin, g_grid.uPageMax,
                        g_grid.uPageActive, pageClip);
         renderGridOverlay(env, width, height, transform);
+        // Margins are background too — same eraser-preview reasoning.
+        renderMarginRules(env, width, height, transform, pageClip);
     }
 
     if (startIdx >= endExclusive) return;
@@ -6647,8 +6716,9 @@ SnapHit findSnap(float x, float y, const Selection* exclude = nullptr,
     // selection snapping to vector geometry many grid cells away
     // when the pen sat near a grid cell center.
     if (g_gridEnabled.load() != 0) {
-        float gx = std::round(x / kGridSpacing) * kGridSpacing;
-        float gy = std::round(y / kGridSpacing) * kGridSpacing;
+        const float spacing = g_gridSpacing.load();
+        float gx = std::round(x / spacing) * spacing;
+        float gy = std::round(y / spacing) * spacing;
         float dx = gx - x, dy = gy - y;
         float gd2 = dx * dx + dy * dy;
         if (gd2 < bestDist2) {
@@ -7310,6 +7380,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
                        g_grid.uPageActive, pageClip);
     }
     renderGridOverlay(env, width, height, transform);
+    renderMarginRules(env, width, height, transform, pageClip);
 
     // Page-boundary rectangle (anchor for the user when zoomed/rotated).
     // Drawn under the layers so strokes that cross the boundary occlude
@@ -10139,6 +10210,28 @@ Java_com_bk_drawing_NativeRenderer_setGridStyle(JNIEnv*, jobject, jint style) {
     // Only 1 (lines) or 2 (dots) are valid; clamp.
     int s = (style == 2) ? 2 : 1;
     g_gridStyle.store(s);
+    g_mbCacheValid = false;
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setGridSpacing(JNIEnv*, jobject, jfloat spacing) {
+    // Floor at a few doc px: the shader's mod() and the snap rounding
+    // both divide by it, and a sub-pixel grid is just a solid wash.
+    g_gridSpacing.store(std::max(4.0f, (float)spacing));
+    g_mbCacheValid = false;
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setMarginsEnabled(JNIEnv*, jobject, jboolean enabled) {
+    g_marginEnabled.store(enabled ? 1 : 0);
+    g_mbCacheValid = false;
+}
+
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setMarginSizes(JNIEnv*, jobject,
+                                                 jfloat top, jfloat side) {
+    g_marginTop.store(std::max(0.0f, (float)top));
+    g_marginSide.store(std::max(0.0f, (float)side));
     g_mbCacheValid = false;
 }
 
