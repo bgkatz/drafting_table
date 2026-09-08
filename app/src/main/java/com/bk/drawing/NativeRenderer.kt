@@ -212,6 +212,10 @@ object NativeRenderer {
     /** PDF export: leave text boxes out of the composite while set. */
     external fun setExportSkipText(skip: Boolean)
 
+    /** Export background / guides: [transparent] drops the paper fill
+     *  so PNGs keep alpha; [skipGuides] hides grid + margin rules. */
+    external fun setExportOptions(transparent: Boolean, skipGuides: Boolean)
+
     /** Every text box on a page, 15 floats each (see renderer.cpp):
      *  id, x, y, w, h, rotation, color, fontSize, bold, italic, align,
      *  lineSpacing, autoWidth, layerVisible, layerOpacity. Empty until

@@ -302,8 +302,8 @@ class MainActivity : AppCompatActivity() {
     // selected URI or null on cancel. The Activity Result API requires
     // the launcher to be created before STARTED, so we bind it here.
     private lateinit var imagePickerLauncher:  ActivityResultLauncher<String>
-    private lateinit var canvasPngLauncher:    ActivityResultLauncher<String>
-    private lateinit var documentPdfLauncher:  ActivityResultLauncher<String>
+    private lateinit var exportPngLauncher:    ActivityResultLauncher<String>
+    private lateinit var exportPdfLauncher:    ActivityResultLauncher<String>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -312,15 +312,17 @@ class MainActivity : AppCompatActivity() {
         ) { uri: Uri? ->
             if (uri != null) decodeAndImportImage(uri)
         }
-        canvasPngLauncher = registerForActivityResult(
+        exportPngLauncher = registerForActivityResult(
             ActivityResultContracts.CreateDocument("image/png")
         ) { uri: Uri? ->
-            if (uri != null) exportActivePageToPng(uri)
+            val plan = pendingExport; pendingExport = null
+            if (uri != null && plan != null) runExport(plan, ExportSink.ToUri(uri))
         }
-        documentPdfLauncher = registerForActivityResult(
+        exportPdfLauncher = registerForActivityResult(
             ActivityResultContracts.CreateDocument("application/pdf")
         ) { uri: Uri? ->
-            if (uri != null) exportDocumentToPdf(uri)
+            val plan = pendingExport; pendingExport = null
+            if (uri != null && plan != null) runExport(plan, ExportSink.ToUri(uri))
         }
         loadFonts()
 
@@ -3160,8 +3162,7 @@ class MainActivity : AppCompatActivity() {
         showPaperPopupMenu(anchor, listOf(
             PaperMenuItem("Backup all documents…")              { backupAllDocuments() },
             PaperMenuItem("Import image…")                      { launchImageImport() },
-            PaperMenuItem("Export canvas as PNG…")              { launchCanvasPngExport() },
-            PaperMenuItem("Export document as PDF…")            { launchDocumentPdfExport() },
+            PaperMenuItem("Export…")                            { showExportDialog() },
             PaperMenuItem("Stylus only: ${if (stylusOnly) "on" else "off"}")
                                                                 { toggleStylusOnly() },
             PaperMenuItem("Delete selection")                   { userDeleteSelection() },
@@ -3184,27 +3185,6 @@ class MainActivity : AppCompatActivity() {
         drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
-    /** Default name for the active page's PNG export. Pages are 1-indexed
-     *  in the user-facing name to match the page-number badge in the
-     *  sidebar (which also displays "01", "02", etc.). */
-    private fun defaultPngFilename(): String {
-        val pageIdx = NativeRenderer.getActivePage()
-        val docName = currentDocName.ifBlank { "Untitled" }
-        return "${docName}_p${pageIdx + 1}.png"
-    }
-
-    private fun defaultPdfFilename(): String {
-        val docName = currentDocName.ifBlank { "Untitled" }
-        return "${docName}.pdf"
-    }
-
-    private fun launchCanvasPngExport() {
-        canvasPngLauncher.launch(defaultPngFilename())
-    }
-
-    private fun launchDocumentPdfExport() {
-        documentPdfLauncher.launch(defaultPdfFilename())
-    }
 
     /**
      * Zip every document under documentsRoot() and write the archive
@@ -3313,22 +3293,264 @@ class MainActivity : AppCompatActivity() {
      *  size when no page bounds are set (the doc behaves as an infinite
      *  plane in that mode). Capped to a sane upper bound so we don't try
      *  to allocate gigabytes for a thousand-page export. */
-    private fun computeExportDimensions(): Pair<Int, Int> {
-        val pw = NativeRenderer.getPageWidth()
-        val ph = NativeRenderer.getPageHeight()
-        if (pw > 0 && ph > 0) return Pair(pw.coerceAtMost(kExportMaxDim),
-                                          ph.coerceAtMost(kExportMaxDim))
-        val v = drawingView
-        val w = (v?.width  ?: 1024).coerceAtLeast(1).coerceAtMost(kExportMaxDim)
-        val h = (v?.height ?: 1024).coerceAtLeast(1).coerceAtMost(kExportMaxDim)
-        return Pair(w, h)
-    }
-
-    private val kExportMaxDim = 4096
 
     /** Render the active page into a fresh bitmap on the GL thread,
      *  then write it to [uri] as a PNG. Failure → toast; the bitmap is
      *  always recycled. */
+    // ====================================================================
+    // Export: one dialog for format (PNG / PDF), pages (current / all /
+    // range), PNG scale + background, guides, and Save vs Share.
+    // ====================================================================
+
+    private class ExportOptions(
+        var format: String = "png",       // "png" | "pdf"
+        var scope: String = "current",    // "current" | "all" | "range"
+        var range: String = "",
+        var scale: Int = 1,               // PNG only
+        var transparent: Boolean = false, // PNG only
+        var guides: Boolean = true,
+    )
+    private val exportOpts = ExportOptions()
+
+    /** One export to run: resolved page indices (0-based) + settings. */
+    private class ExportPlan(
+        val pages: List<Int>, val format: String, val scale: Int,
+        val transparent: Boolean, val guides: Boolean, val docName: String,
+    )
+    private var pendingExport: ExportPlan? = null
+
+    private sealed class ExportSink {
+        class ToUri(val uri: Uri) : ExportSink()      // single file via the picker
+        class ToFolder(val dir: File) : ExportSink()  // one PNG per page, next to the docs
+        object Share : ExportSink()                   // stage in cache, share sheet
+    }
+
+    private fun loadExportOptions() {
+        val p = prefs()
+        exportOpts.format = p.getString("export_format", "png") ?: "png"
+        exportOpts.scale = p.getInt("export_scale", 1).coerceIn(1, 3)
+        exportOpts.transparent = p.getBoolean("export_transparent", false)
+        exportOpts.guides = p.getBoolean("export_guides", true)
+        // Pages always start back at "current" — a stale range is a
+        // surprise, the other settings are preferences.
+        exportOpts.scope = "current"
+    }
+
+    private fun saveExportOptions() {
+        prefs().edit()
+            .putString("export_format", exportOpts.format)
+            .putInt("export_scale", exportOpts.scale)
+            .putBoolean("export_transparent", exportOpts.transparent)
+            .putBoolean("export_guides", exportOpts.guides)
+            .apply()
+    }
+
+    /** "1-3, 7" → sorted distinct 0-based indices within the document. */
+    private fun parsePageRange(text: String, pageCount: Int): List<Int> {
+        val out = sortedSetOf<Int>()
+        for (tok in text.split(',', ';', ' ')) {
+            val t = tok.trim()
+            if (t.isEmpty()) continue
+            val m = Regex("^(\\d+)\\s*[-–]\\s*(\\d+)$").find(t)
+            if (m != null) {
+                val a = m.groupValues[1].toInt(); val b = m.groupValues[2].toInt()
+                for (n in minOf(a, b)..maxOf(a, b)) if (n in 1..pageCount) out += n - 1
+            } else {
+                t.toIntOrNull()?.let { if (it in 1..pageCount) out += it - 1 }
+            }
+        }
+        return out.toList()
+    }
+
+    private fun resolveExportPages(): List<Int> {
+        val count = NativeRenderer.getPageCount().coerceAtLeast(1)
+        return when (exportOpts.scope) {
+            "all"   -> (0 until count).toList()
+            "range" -> parsePageRange(exportOpts.range, count)
+            else    -> listOf(NativeRenderer.getActivePage().coerceIn(0, count - 1))
+        }
+    }
+
+    private fun showExportDialog() {
+        loadExportOptions()
+        val pad = 18.dp
+        val ink = getColor(R.color.ink); val inkSoft = getColor(R.color.inkSoft)
+        val hot = getColor(R.color.hot)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(getColor(R.color.paper))
+            setPadding(pad, pad, pad, pad)
+        }
+        container.addView(makePaperDialogTitle("Export"),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 10.dp })
+
+        val refreshers = mutableListOf<() -> Unit>()
+        lateinit var refreshAll: () -> Unit
+
+        /** label + a row of mutually-exclusive chips. */
+        fun chipRow(label: String, options: List<String>,
+                    selected: () -> Int, onPick: (Int) -> Unit): View {
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 4.dp, 0, 4.dp)
+            }
+            row.addView(TextView(this).apply {
+                text = label
+                typeface = fontMono ?: Typeface.MONOSPACE
+                textSize = 11f
+                setTextColor(inkSoft)
+            }, LinearLayout.LayoutParams(96.dp, ViewGroup.LayoutParams.WRAP_CONTENT))
+            val chips = options.mapIndexed { i, name ->
+                TextView(this).apply {
+                    text = name
+                    typeface = fontMono ?: Typeface.MONOSPACE
+                    textSize = 12f
+                    setPadding(10.dp, 6.dp, 10.dp, 6.dp)
+                    isClickable = true; isFocusable = true
+                    setOnClickListener { onPick(i); refreshAll() }
+                }
+            }
+            for (c in chips) row.addView(c, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            refreshers += {
+                val sel = selected()
+                for ((i, c) in chips.withIndex()) {
+                    c.setTextColor(if (i == sel) hot else inkSoft)
+                    c.typeface = if (i == sel) (fontMonoSemibold ?: Typeface.MONOSPACE)
+                                 else (fontMono ?: Typeface.MONOSPACE)
+                }
+            }
+            return row
+        }
+
+        val formatRow = chipRow("format", listOf("PNG", "PDF"),
+            { if (exportOpts.format == "pdf") 1 else 0 }) {
+            exportOpts.format = if (it == 1) "pdf" else "png"
+        }
+        val pagesRow = chipRow("pages", listOf("current", "all", "range"),
+            { when (exportOpts.scope) { "all" -> 1; "range" -> 2; else -> 0 } }) {
+            exportOpts.scope = when (it) { 1 -> "all"; 2 -> "range"; else -> "current" }
+        }
+        val rangeInput = android.widget.EditText(this).apply {
+            setText(exportOpts.range)
+            hint = "e.g. 1-3, 7"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(ink)
+            backgroundTintList = android.content.res.ColorStateList.valueOf(inkSoft)
+            isSingleLine = true
+        }
+        val scaleRow = chipRow("scale", listOf("1x", "2x", "3x"),
+            { exportOpts.scale - 1 }) { exportOpts.scale = it + 1 }
+        val bgRow = chipRow("background", listOf("paper", "transparent"),
+            { if (exportOpts.transparent) 1 else 0 }) { exportOpts.transparent = it == 1 }
+        val guidesRow = chipRow("guides", listOf("include", "hide"),
+            { if (exportOpts.guides) 0 else 1 }) { exportOpts.guides = it == 0 }
+
+        refreshAll = {
+            for (r in refreshers) r()
+            val png = exportOpts.format == "png"
+            scaleRow.visibility = if (png) View.VISIBLE else View.GONE
+            bgRow.visibility = if (png) View.VISIBLE else View.GONE
+            rangeInput.visibility = if (exportOpts.scope == "range") View.VISIBLE else View.GONE
+        }
+
+        val wrap = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        container.addView(formatRow, wrap)
+        container.addView(pagesRow, wrap)
+        container.addView(rangeInput, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = 96.dp; bottomMargin = 4.dp })
+        container.addView(scaleRow, wrap)
+        container.addView(bgRow, wrap)
+        container.addView(guidesRow, wrap)
+
+        // Cancel | Share | Save
+        val (buttons, cancelBtn, saveBtn) = makePaperDialogButtons("Save")
+        val shareBtn = TextView(this).apply {
+            text = "Share"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(ink)
+            setPadding(16.dp, 10.dp, 16.dp, 10.dp)
+            isClickable = true; isFocusable = true
+        }
+        buttons.addView(shareBtn, 1, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        container.addView(buttons, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = 10.dp })
+
+        refreshAll()
+        val dialog = showPaperDialog(container)
+        cancelBtn.setOnClickListener { dialog.dismiss() }
+        val go = { share: Boolean ->
+            exportOpts.range = rangeInput.text.toString()
+            dialog.dismiss()
+            startExport(share)
+        }
+        shareBtn.setOnClickListener { go(true) }
+        saveBtn.setOnClickListener { go(false) }
+    }
+
+    private fun startExport(share: Boolean) {
+        val pages = resolveExportPages()
+        if (pages.isEmpty()) {
+            android.widget.Toast.makeText(this, "No pages in that range",
+                android.widget.Toast.LENGTH_SHORT).show()
+            return
+        }
+        saveExportOptions()
+        val plan = ExportPlan(pages, exportOpts.format, exportOpts.scale,
+                              exportOpts.transparent, exportOpts.guides,
+                              currentDocName.ifBlank { "Untitled" })
+        if (share) { runExport(plan, ExportSink.Share); return }
+        when {
+            plan.format == "pdf" -> {
+                pendingExport = plan
+                exportPdfLauncher.launch(exportBaseName(plan) + ".pdf")
+            }
+            plan.pages.size == 1 -> {
+                pendingExport = plan
+                exportPngLauncher.launch("${plan.docName}_p${plan.pages[0] + 1}.png")
+            }
+            else -> {
+                // A page set can't be one file, and Android's folder
+                // picker refuses the root and Download folders — so
+                // the set goes next to the documents, where the Files
+                // app already looks: <Drafting Table>/exports/<doc>/.
+                val dir = File(File(documentsRoot(), "exports"), plan.docName)
+                dir.mkdirs()
+                runExport(plan, ExportSink.ToFolder(dir))
+            }
+        }
+    }
+
+    /** "doc", "doc_p3", or "doc_p2-5" depending on the page set. */
+    private fun exportBaseName(plan: ExportPlan): String {
+        val count = NativeRenderer.getPageCount().coerceAtLeast(1)
+        val pg = plan.pages
+        return when {
+            pg.size == count -> plan.docName
+            pg.size == 1 -> "${plan.docName}_p${pg[0] + 1}"
+            else -> "${plan.docName}_p${pg.first() + 1}-${pg.last() + 1}"
+        }
+    }
+
+    private val kExportMaxDim = 4096
+
+    /** Bitmap dims for a page at [scale], shrunk uniformly if either
+     *  side would exceed the GPU cap — no letterbox bars. */
+    private fun exportDims(scale: Float): Pair<Int, Int> {
+        val pw = NativeRenderer.getPageWidth().coerceAtLeast(1).toFloat()
+        val ph = NativeRenderer.getPageHeight().coerceAtLeast(1).toFloat()
+        val f = minOf(scale, kExportMaxDim / pw, kExportMaxDim / ph)
+        return Pair(Math.round(pw * f).coerceAtLeast(1), Math.round(ph * f).coerceAtLeast(1))
+    }
+
     /** Letterbox factor the export composite applies to a page rendered
      *  into a (w, h) bitmap: doc px → bitmap px, plus the centring
      *  offsets. Mirrors renderPageThumbnail. */
@@ -3339,85 +3561,155 @@ class MainActivity : AppCompatActivity() {
         return Triple(s, (w - s * pw) * 0.5f, (h - s * ph) * 0.5f)
     }
 
-    private fun exportActivePageToPng(uri: Uri) {
+    private fun exportCacheDir(): File {
+        val dir = File(cacheDir, "exports")
+        dir.mkdirs()
+        dir.listFiles()?.forEach { it.delete() }
+        return dir
+    }
+
+    /**
+     * Render each page on the GL thread one at a time (a 3x page is
+     * ~64 MB, so never all at once) and deliver to [sink]. PNG pages
+     * get a tiny "load" render first so the page's text boxes can be
+     * re-rastered at the export scale before the real pass. PDF pages
+     * leave text out of the composite and draw it as real text.
+     */
+    private fun runExport(plan: ExportPlan, sink: ExportSink) {
         val v = drawingView ?: return
-        val (w, h) = computeExportDimensions()
-        val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val pageIdx = NativeRenderer.getActivePage()
-        // Text boxes are rasterized at the export scale first so the
-        // PNG gets crisp text rather than the screen-resolution raster.
-        if (::textEditor.isInitialized) {
-            textEditor.prepareForPngExport(exportTransform(w, h).first)
-        }
-        v.queueExportRender(
-            listOf(DrawingSurfaceView.ExportPage(pageIdx, bitmap))
-        ) {
-            try {
-                contentResolver.openOutputStream(uri)?.use { os ->
-                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, os)
-                }
-                android.widget.Toast.makeText(this,
-                    "Exported PNG", android.widget.Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                android.util.Log.e("DrawingApp", "PNG export failed", e)
-                android.widget.Toast.makeText(this,
-                    "Export failed: ${e.message}",
+        if (::textEditor.isInitialized) textEditor.commitIfOpen()
+        val png = plan.format == "png"
+        val (w, h) = exportDims(if (png) plan.scale.toFloat() else 1f)
+        val (ts, tox, toy) = exportTransform(w, h)
+        NativeRenderer.setExportOptions(png && plan.transparent, !plan.guides)
+        NativeRenderer.setExportSkipText(!png)
+        val staged = mutableListOf<File>()
+        val cache = if (sink is ExportSink.Share) exportCacheDir() else null
+        val pdf = if (png) null else android.graphics.pdf.PdfDocument()
+
+        fun finish(error: String?) {
+            NativeRenderer.setExportOptions(false, false)
+            NativeRenderer.setExportSkipText(false)
+            v.forceRedraw()
+            if (error != null) {
+                pdf?.close()
+                android.widget.Toast.makeText(this, "Export failed: $error",
                     android.widget.Toast.LENGTH_LONG).show()
-            } finally {
-                bitmap.recycle()
+                return
+            }
+            try {
+                if (pdf != null) {
+                    when (sink) {
+                        is ExportSink.ToUri -> contentResolver.openOutputStream(sink.uri)?.use { pdf.writeTo(it) }
+                        ExportSink.Share -> {
+                            val f = File(cache!!, exportBaseName(plan) + ".pdf")
+                            f.outputStream().use { pdf.writeTo(it) }
+                            staged += f
+                        }
+                        is ExportSink.ToFolder -> {}
+                    }
+                    pdf.close()
+                }
+                val n = plan.pages.size
+                if (sink is ExportSink.Share) {
+                    shareExportFiles(staged, if (png) "image/png" else "application/pdf")
+                } else {
+                    val where = if (sink is ExportSink.ToFolder)
+                        " to ${sink.dir.relativeTo(documentsRoot().parentFile ?: sink.dir)}"
+                        else ""
+                    val what = if (png) (if (n == 1) "PNG" else "$n PNGs")
+                               else "PDF · $n page${if (n == 1) "" else "s"}"
+                    android.widget.Toast.makeText(this, "Exported $what$where",
+                        android.widget.Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("DrawingApp", "export finish failed", e)
+                android.widget.Toast.makeText(this, "Export failed: ${e.message}",
+                    android.widget.Toast.LENGTH_LONG).show()
+            }
+        }
+
+        fun step(i: Int) {
+            if (i >= plan.pages.size) { finish(null); return }
+            val pageIdx = plan.pages[i]
+            if (png) {
+                val probe = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+                v.queueExportRender(listOf(DrawingSurfaceView.ExportPage(pageIdx, probe))) {
+                    probe.recycle()
+                    if (::textEditor.isInitialized) textEditor.prepareForPngExport(pageIdx, ts)
+                    val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                    v.queueExportRender(listOf(DrawingSurfaceView.ExportPage(pageIdx, bmp))) {
+                        try {
+                            writeExportPng(bmp, pageIdx, plan, sink, cache, staged)
+                            bmp.recycle()
+                            step(i + 1)
+                        } catch (e: Exception) {
+                            android.util.Log.e("DrawingApp", "PNG export failed", e)
+                            bmp.recycle()
+                            finish(e.message ?: "write failed")
+                        }
+                    }
+                }
+            } else {
+                val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                v.queueExportRender(listOf(DrawingSurfaceView.ExportPage(pageIdx, bmp))) {
+                    try {
+                        val info = android.graphics.pdf.PdfDocument.PageInfo
+                            .Builder(w, h, i + 1).create()
+                        val page = pdf!!.startPage(info)
+                        page.canvas.drawBitmap(bmp, 0f, 0f, null)
+                        TextLayout.drawPageTextToCanvas(this, page.canvas, pageIdx, ts, tox, toy)
+                        pdf.finishPage(page)
+                        bmp.recycle()
+                        step(i + 1)
+                    } catch (e: Exception) {
+                        android.util.Log.e("DrawingApp", "PDF export failed", e)
+                        bmp.recycle()
+                        finish(e.message ?: "render failed")
+                    }
+                }
+            }
+        }
+        step(0)
+    }
+
+    private fun writeExportPng(bmp: Bitmap, pageIdx: Int, plan: ExportPlan,
+                               sink: ExportSink, cache: File?, staged: MutableList<File>) {
+        val name = "${plan.docName}_p${pageIdx + 1}.png"
+        when (sink) {
+            is ExportSink.ToUri -> contentResolver.openOutputStream(sink.uri)?.use {
+                bmp.compress(Bitmap.CompressFormat.PNG, 100, it)
+            } ?: throw java.io.IOException("couldn't open destination")
+            is ExportSink.ToFolder -> {
+                val f = File(sink.dir, name)
+                f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            }
+            ExportSink.Share -> {
+                val f = File(cache!!, name)
+                f.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                staged += f
             }
         }
     }
 
-    /** Render every page into its own bitmap on the GL thread, then
-     *  build a multi-page PdfDocument with one bitmap per page (1 doc-px
-     *  = 1 PDF point — keeps the on-paper geometry intact). */
-    private fun exportDocumentToPdf(uri: Uri) {
-        val v = drawingView ?: return
-        val (w, h) = computeExportDimensions()
-        val pageCount = NativeRenderer.getPageCount().coerceAtLeast(1)
-        val bitmaps = (0 until pageCount).map {
-            Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    private fun shareExportFiles(files: List<File>, mime: String) {
+        if (files.isEmpty()) return
+        val uris = files.map {
+            androidx.core.content.FileProvider.getUriForFile(this, "$packageName.fileprovider", it)
         }
-        val renders = bitmaps.mapIndexed { i, b ->
-            DrawingSurfaceView.ExportPage(i, b)
-        }
-        // Text boxes go into the PDF as real text (selectable, sharp at
-        // any zoom): the page composites leave them out and we draw
-        // them onto each page canvas after its bitmap. They land above
-        // all raster content on the page — accepted trade-off.
-        if (::textEditor.isInitialized) textEditor.commitIfOpen()
-        NativeRenderer.setExportSkipText(true)
-        val (ts, tox, toy) = exportTransform(w, h)
-        v.queueExportRender(renders) {
-            try {
-                val pdf = android.graphics.pdf.PdfDocument()
-                for ((i, bmp) in bitmaps.withIndex()) {
-                    val info = android.graphics.pdf.PdfDocument.PageInfo
-                        .Builder(w, h, i + 1).create()
-                    val page = pdf.startPage(info)
-                    page.canvas.drawBitmap(bmp, 0f, 0f, null)
-                    TextLayout.drawPageTextToCanvas(this, page.canvas, i, ts, tox, toy)
-                    pdf.finishPage(page)
-                }
-                contentResolver.openOutputStream(uri)?.use { os ->
-                    pdf.writeTo(os)
-                }
-                pdf.close()
-                android.widget.Toast.makeText(this,
-                    "Exported PDF · $pageCount page${if (pageCount == 1) "" else "s"}",
-                    android.widget.Toast.LENGTH_SHORT).show()
-            } catch (e: Exception) {
-                android.util.Log.e("DrawingApp", "PDF export failed", e)
-                android.widget.Toast.makeText(this,
-                    "Export failed: ${e.message}",
-                    android.widget.Toast.LENGTH_LONG).show()
-            } finally {
-                bitmaps.forEach { it.recycle() }
-                NativeRenderer.setExportSkipText(false)
-                v.forceRedraw()
+        val intent = if (uris.size == 1) {
+            android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = mime
+                putExtra(android.content.Intent.EXTRA_STREAM, uris[0])
+            }
+        } else {
+            android.content.Intent(android.content.Intent.ACTION_SEND_MULTIPLE).apply {
+                type = mime
+                putParcelableArrayListExtra(android.content.Intent.EXTRA_STREAM, ArrayList(uris))
             }
         }
+        intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        startActivity(android.content.Intent.createChooser(intent, "Share export"))
     }
 
     /** Open the system image picker. Result handled in the launcher

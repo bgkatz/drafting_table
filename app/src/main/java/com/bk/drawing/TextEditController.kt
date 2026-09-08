@@ -268,10 +268,9 @@ class TextEditController(
      *  box on the active page at the export's doc→pixel scale so the
      *  saved image isn't limited to screen resolution. Uploads land on
      *  the same GL pass that renders the export. */
-    fun prepareForPngExport(exportScale: Float) {
+    fun prepareForPngExport(pageIdx: Int, exportScale: Float) {
         commitIfOpen()
-        val page = NativeRenderer.getActivePage()
-        for (p in TextLayout.loadPageBoxes(page)) {
+        for (p in TextLayout.loadPageBoxes(pageIdx)) {
             if (p.box.text.isEmpty()) continue
             TextLayout.rasterizeAndUploadAt(ctx, p.box, exportScale)
         }

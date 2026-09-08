@@ -1924,6 +1924,11 @@ std::atomic<uint32_t> g_textEditingId{0};
 // Set around the export render; the on-screen frame after it is
 // forced to redraw.
 std::atomic<int> g_exportSkipText{0};
+// Export options (set by Kotlin around an export render, cleared
+// after): transparent = no off-page gray / paper-white fill, so a PNG
+// keeps alpha; skipGuides = no grid / margin rules.
+std::atomic<int> g_exportTransparent{0};
+std::atomic<int> g_exportSkipGuides{0};
 
 // Scale Kotlin should rasterize a box at for the given view scale:
 // the view scale, clamped, then reduced if the box would exceed the
@@ -8005,7 +8010,14 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
 
     {
         ATRACE_SCOPE("DrawingApp.compositeAllLayers.clearAndGrid");
-    if (pageClip.active) {
+    if (g_exportTransparent.load() != 0) {
+        // Transparent export: no background at all — strokes over alpha.
+        glDisable(GL_BLEND);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    } else if (pageClip.active) {
         // Off-canvas background: light gray clear, then paint paper-white
         // over the page rectangle. With page disabled, fall back to a
         // single paper-white clear (the original behavior).
@@ -8033,14 +8045,17 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
 
     // Grid is part of the page background — between the paper-white clear
     // and the layer tiles, so user strokes naturally occlude it. Grid
-    // shader discards fragments outside the page when active.
-    {
-        glUseProgram(g_grid.program);
-        uploadPageClip(g_grid.uPageMin, g_grid.uPageMax,
-                       g_grid.uPageActive, pageClip);
+    // shader discards fragments outside the page when active. Exports
+    // can opt out of both guides.
+    if (g_exportSkipGuides.load() == 0) {
+        {
+            glUseProgram(g_grid.program);
+            uploadPageClip(g_grid.uPageMin, g_grid.uPageMax,
+                           g_grid.uPageActive, pageClip);
+        }
+        renderGridOverlay(env, width, height, transform);
+        renderMarginRules(env, width, height, transform, pageClip);
     }
-    renderGridOverlay(env, width, height, transform);
-    renderMarginRules(env, width, height, transform, pageClip);
 
     // Page-boundary rectangle (anchor for the user when zoomed/rotated).
     // Drawn under the layers so strokes that cross the boundary occlude
@@ -11185,6 +11200,17 @@ Java_com_bk_drawing_NativeRenderer_getSelectedTextBoxId(JNIEnv*, jobject) {
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setExportSkipText(JNIEnv*, jobject, jboolean skip) {
     g_exportSkipText.store(skip ? 1 : 0);
+    g_mbCacheValid = false;
+}
+
+// Export background / guide options; both false restores the normal
+// on-screen composite.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setExportOptions(JNIEnv*, jobject,
+                                                   jboolean transparent,
+                                                   jboolean skipGuides) {
+    g_exportTransparent.store(transparent ? 1 : 0);
+    g_exportSkipGuides.store(skipGuides ? 1 : 0);
     g_mbCacheValid = false;
 }
 
