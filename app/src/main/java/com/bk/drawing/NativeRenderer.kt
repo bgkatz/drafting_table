@@ -22,6 +22,17 @@ object NativeRenderer {
     external fun loadDocument(path: String)
 
     /**
+     * Tell native a new EGL context is in use. GL thread only, once per
+     * GLFrontBufferedRenderer instance, before any other native call on
+     * that context. When the process outlived the previous Activity
+     * (Back press, not a task swipe), native still holds GL names from
+     * the destroyed context; this makes it forget them, relink its
+     * programs, and reload the document from disk. A no-op in a fresh
+     * process.
+     */
+    external fun onGlContextCreated()
+
+    /**
      * Block the calling thread until every queued tile write/delete
      * has been drained. Tile saves run on a background thread; this is
      * the synchronization point used at doc switches and on app pause

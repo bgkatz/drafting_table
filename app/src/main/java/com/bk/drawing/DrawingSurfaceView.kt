@@ -193,6 +193,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         ) {
             android.os.Trace.beginSection("DrawingApp.onDrawFrontBufferedLayer")
             try {
+            announceGlContext()
             // Native shaders expect `transform` to be doc-pixel →
             // buffer-pixel; compose the framework's view→buffer with our
             // current doc→view here.
@@ -250,6 +251,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         ) {
             android.os.Trace.beginSection("DrawingApp.onDrawMultiBufferedLayer")
             try {
+            announceGlContext()
             val composed = composedTransform(transform)
             // Only commit a brush/eraser stroke if this batch actually
             // contained Sample entries. Line previews go through here too
@@ -535,6 +537,29 @@ class DrawingSurfaceView @JvmOverloads constructor(
 
     private var renderer: GLFrontBufferedRenderer<StrokeAction>? =
         GLFrontBufferedRenderer(this, callback)
+
+    /** Each GLFrontBufferedRenderer owns one EGL context, and each view
+     *  instance owns one renderer, so "first callback on this view" is
+     *  "first call on this context". Native must hear about a new
+     *  context before it touches any GL name it cached from the last
+     *  one (a cached process keeps those across Activity restarts). */
+    private var glContextAnnounced = false
+    private fun announceGlContext() {
+        if (glContextAnnounced) return
+        glContextAnnounced = true
+        // A cached process can have the previous Activity's GL thread
+        // still inside a native call (release() is asynchronous, and a
+        // tile load for a background page runs for seconds). Resetting
+        // native state under it segfaults, so wait for its teardown
+        // first. Blocks only this GL thread, and only on a relaunch.
+        pendingRendererRelease?.let { latch ->
+            if (!latch.await(15, java.util.concurrent.TimeUnit.SECONDS)) {
+                Log.w("DrawingApp", "previous renderer release did not complete in 15 s")
+            }
+            pendingRendererRelease = null
+        }
+        NativeRenderer.onGlContextCreated()
+    }
 
     // Motion-prediction support. Lazily created on first stroke event.
     // When enabled, every real MotionEvent is fed to the predictor and a
@@ -1197,6 +1222,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     private companion object {
+        /** Process-global: the release of the most recently released
+         *  renderer, or null once a successor has waited on it. Native
+         *  state is process-global too, which is why this can't be
+         *  per-view. */
+        @Volatile var pendingRendererRelease: java.util.concurrent.CountDownLatch? = null
+
         /** View-px the pen must travel before a TEXT tap becomes a
          *  drag-to-place. */
         const val kTextDragSlopPx = 14f
@@ -2075,8 +2106,19 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     fun release() {
-        renderer?.release(true)
+        val r = renderer ?: return
         renderer = null
+        // Counted down once the renderer's GL thread has torn down —
+        // the earliest point at which a successor context may touch
+        // native state. See announceGlContext.
+        val latch = java.util.concurrent.CountDownLatch(1)
+        pendingRendererRelease = latch
+        // cancelPending = false: onPause queued one last no-stroke MB
+        // pass (forceRedraw) whose job is to drain commitStroke's
+        // deferred tile saves; cancelling it here would drop the last
+        // ~250 ms of strokes on a Back press. Letting it run costs one
+        // frame of teardown time.
+        r.release(false) { latch.countDown() }
     }
 
     override fun onDetachedFromWindow() {

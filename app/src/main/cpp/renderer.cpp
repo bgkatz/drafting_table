@@ -1599,6 +1599,10 @@ inline void shadePathPush(float x, float y) {
 // dirty bbox. Saves ~9 ms per commit on typical strokes — enough to
 // land commits inside one 90 Hz vsync and eliminate the flash.
 ViewFbo g_mbCache;
+
+// renderPageThumbnail's cached FBO + colour attachment (see there).
+GLuint g_thumbFbo = 0, g_thumbTex = 0;
+int    g_thumbW = 0, g_thumbH = 0;
 // Set true once g_mbCache contains a valid copy of the previous
 // frame's MB content. Reset whenever something invalidates that
 // cache (transform/zoom changed, layer count changed, doc switched,
@@ -2560,6 +2564,11 @@ void writeTileBytesToDisk(size_t layerIdx, int tx, int ty,
                           const uint8_t* bytes);
 void enqueueDeferredSave(size_t layerIdx, int64_t tileK);
 void drainPendingSaveTiles();
+void clearPendingSaveTiles();
+void rehydrateTilesAfterContextLoss();
+void ensureInited();
+struct Tile;
+void createTileGl(Tile& t, int tx, int ty, const uint8_t* initial);
 void drainPendingSaveTilesForBbox(size_t layerIdx,
                                   int tx0, int tx1, int ty0, int ty1);
 static void flushDiskWriter();
@@ -3017,6 +3026,10 @@ void closeCurrentDocument() {
     // cancel so the source pixels are restored — but the tiles get
     // freed below anyway, so this just keeps the in-memory state clean.
     cancelRasterSelectionImpl();
+    // Note: freeing ~1100 tiles' 256 KB CPU mirrors here costs ~3 s on
+    // this device. Moving it to a background thread was tried and
+    // only slowed the next document's load by the same amount
+    // (contention on the allocator / page tables), so it stays here.
     for (auto& page : g_pages) {
         if (!page) continue;
         for (auto& layer : page->layers) {
@@ -3050,6 +3063,74 @@ void closeCurrentDocument() {
     g_current.samples.clear();
     g_liveEmitter.reset();
     g_loaded.store(false, std::memory_order_release);
+}
+
+// The native side is process-global but the EGL context belongs to the
+// Activity's GLFrontBufferedRenderer. Pressing Back finishes the
+// Activity and keeps the process cached; the next launch builds a new
+// context, and every GL name we hold — programs, VAOs, view FBOs, tile
+// textures, text rasters — refers to objects that no longer exist. With
+// g_inited still true, ensureInited skipped relinking and the app drew
+// nothing until the process was actually killed. Kotlin calls this once
+// per renderer instance, before any other native call on the new
+// context. It forgets every handle WITHOUT glDelete-ing it: those
+// numbers may already name the framework's own front/multi buffers in
+// the fresh context. Document state is dropped and reloaded from disk
+// (every commit saved there already); undo, like on any restart, is
+// gone. A floating raster selection lived only on the GPU and is lost.
+void resetForNewGlContext() {
+    if (!g_inited) return;   // fresh process: nothing stale to forget
+    LOGI("GL context replaced — relinking programs and re-uploading tiles");
+    auto t0 = std::chrono::steady_clock::now();
+    auto msSince = [&]() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+    };
+    flushDiskWriter();
+    // Deferred saves point at FBOs that died with the context; their
+    // tiles have a null mirror and get re-read from disk below.
+    clearPendingSaveTiles();
+    {
+        // The floating pixels lived only in contentTex — gone. Zero the
+        // name so the cancel below doesn't delete it in the new context.
+        std::lock_guard<std::mutex> lock(g_rasterSelMutex);
+        g_rasterSel.contentTex = 0;
+    }
+    g_textTextures.clear();
+    {
+        std::lock_guard<std::mutex> lock(g_textRasterScaleMutex);
+        g_textRasterScales.clear();
+    }
+    g_dab = DabProg{};           g_comp = CompProg{};
+    g_preview = PreviewProg{};   g_grid = GridProg{};
+    g_lineProg = LineProg{};     g_ellipseProg = EllipseProg{};
+    g_rectProg = RectProg{};     g_textProg = TextProg{};
+    g_pixelGridProg = PixelGridProg{};
+    g_stamp = StampProg{};       g_fill = FillProg{};
+    g_poly = PolyProg{};         g_sel = SelProg{};
+    g_quadVao = g_quadVbo = g_polyVao = g_polyVbo = 0;
+    g_belowFbo = ViewFbo{};      g_aboveFbo = ViewFbo{};
+    g_coverage = ViewFbo{};      g_coverageReal = ViewFbo{};
+    g_strokeCoverageTile = ViewFbo{};
+    g_shadeCoverage = ViewFbo{}; g_mbCache = ViewFbo{};
+    g_mbCacheValid = false;
+    g_thumbFbo = g_thumbTex = 0;
+    g_thumbW = g_thumbH = 0;
+    g_current.samples.clear();
+    g_liveEmitter.reset();
+    g_inited = false;
+    ensureInited();              // relink now: the tile rebuild and the
+                                 // selection cancel below draw with them
+    LOGI("  context reset: programs relinked at %lld ms", (long long)msSince());
+    // Pages, layers, shapes, text boxes, the undo stack and the vector
+    // selection are all CPU state and stay. Tiles get new GL objects
+    // from their mirrors — no disk read, no free, no reallocation.
+    rehydrateTilesAfterContextLoss();
+    // A floating raster selection can't survive (its pixels are gone),
+    // but its lift snapshots are CPU-side: cancelling puts the source
+    // tiles back so the document is whole.
+    cancelRasterSelectionImpl();
+    LOGI("  context reset: done at %lld ms", (long long)msSince());
 }
 
 // ---- Shader / program helpers --------------------------------------------
@@ -3595,6 +3676,28 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
     if (it != layer.tiles.end()) return it->second;
 
     Tile t;
+    createTileGl(t, tx, ty, initial);
+    if (initial) {
+        // Mirror the upload into the BEFORE-snapshot cache. Shared
+        // refcounted buffer (from the pool), see TileBytes.
+        t.cachedBytes = acquireTileBytesFrom(initial);
+    } else {
+        // Freshly cleared (interior is all zero). Allocate the cache
+        // to a zeroed buffer — same memory cost as if it had been
+        // populated and the eventual mutation will replace it. Pool
+        // returns a buffer with undefined contents, so zero-fill.
+        t.cachedBytes = acquireZeroedTileBytes();
+    }
+
+    layer.tiles[k] = t;
+    return layer.tiles[k];
+}
+
+// The GL half of tile creation: texture + FBO, cleared, with the
+// interior optionally uploaded from [initial]. Leaves the FBO bound and
+// the viewport tile-sized, like it always did. Split out so a context
+// reset can rebuild a tile's GL objects from its own CPU mirror.
+void createTileGl(Tile& t, int tx, int ty, const uint8_t* initial) {
     glGenTextures(1, &t.texture);
     glBindTexture(GL_TEXTURE_2D, t.texture);
     // 258×258 storage; interior 256×256 sits at texels [kApron..kApron+255]
@@ -3626,19 +3729,63 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
         glTexSubImage2D(GL_TEXTURE_2D, 0, kApron, kApron,
                         kTileSize, kTileSize,
                         GL_RGBA, GL_UNSIGNED_BYTE, initial);
-        // Mirror the upload into the BEFORE-snapshot cache. Shared
-        // refcounted buffer (from the pool), see TileBytes.
-        t.cachedBytes = acquireTileBytesFrom(initial);
-    } else {
-        // Freshly cleared (interior is all zero). Allocate the cache
-        // to a zeroed buffer — same memory cost as if it had been
-        // populated and the eventual mutation will replace it. Pool
-        // returns a buffer with undefined contents, so zero-fill.
-        t.cachedBytes = acquireZeroedTileBytes();
     }
+}
 
-    layer.tiles[k] = t;
-    return layer.tiles[k];
+// After a GL context replacement: give every loaded tile new GL objects
+// from its CPU mirror, without touching disk or freeing anything. A
+// tile whose mirror was nulled by a still-pending deferred save has
+// lost that content (it only existed in the dead FBO); it is re-read
+// from disk, i.e. reverts to its last saved state. Restores the FBO
+// binding and viewport it found, since the caller runs before
+// renderDocument captures the framework's multi-buffer FBO.
+void rehydrateTilesAfterContextLoss() {
+    GLint prevFbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    GLint vp[4];
+    glGetIntegerv(GL_VIEWPORT, vp);
+
+    size_t kept = 0, reread = 0, lost = 0;
+    std::vector<uint8_t> buf(kTileBytes);
+    for (size_t pi = 0; pi < g_pages.size(); ++pi) {
+        auto& page = g_pages[pi];
+        if (!page) continue;
+        for (size_t li = 0; li < page->layers.size(); ++li) {
+            auto& layer = page->layers[li];
+            if (!layer) continue;
+            std::vector<int64_t> stale;
+            for (auto& kv : layer->tiles) {
+                Tile& t = kv.second;
+                t.texture = 0; t.fbo = 0;   // stale names, never deleted
+                t.apronStale = true;
+                if (!t.cachedBytes) { stale.push_back(kv.first); continue; }
+                int tx, ty;
+                unpackTileKey(kv.first, tx, ty);
+                createTileGl(t, tx, ty, t.cachedBytes->data());
+                ++kept;
+            }
+            if (stale.empty()) continue;
+            std::string dir = pageDirOf(pi) + "/layer_" + std::to_string(li);
+            for (int64_t k : stale) {
+                layer->tiles.erase(k);
+                int tx, ty;
+                unpackTileKey(k, tx, ty);
+                std::string path = dir + "/tile_" + std::to_string(tx) + "_"
+                                 + std::to_string(ty) + ".bin";
+                FILE* f = fopen(path.c_str(), "rb");
+                if (!f) { ++lost; continue; }
+                size_t n = fread(buf.data(), 1, buf.size(), f);
+                fclose(f);
+                if (n != buf.size()) { ++lost; continue; }
+                getOrCreateTile(*layer, tx, ty, buf.data());
+                ++reread;
+            }
+        }
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(prevFbo));
+    glViewport(vp[0], vp[1], vp[2], vp[3]);
+    LOGI("  context reset: tiles re-uploaded from memory: %zu, re-read from disk: %zu, lost: %zu",
+         kept, reread, lost);
 }
 
 // Mark this tile's apron stale, plus all 8 surrounding tiles' aprons
@@ -6169,6 +6316,12 @@ void enqueueDeferredSave(size_t layerIdx, int64_t tileK) {
         }
     }
     g_pendingSaveTiles.emplace_back(layerIdx, tileK);
+}
+
+// Forget deferred saves without writing them. Only for the GL-context
+// reset, where the FBOs they'd read from no longer exist.
+void clearPendingSaveTiles() {
+    g_pendingSaveTiles.clear();
 }
 
 void drainPendingSaveTiles() {
@@ -10621,6 +10774,14 @@ Java_com_bk_drawing_NativeRenderer_flushPendingSaveTiles(JNIEnv*, jobject) {
     drainPendingSaveTiles();
 }
 
+// Called on the GL thread once per GLFrontBufferedRenderer instance,
+// before any other native call on its context — see
+// resetForNewGlContext for why a cached process needs this.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_onGlContextCreated(JNIEnv*, jobject) {
+    resetForNewGlContext();
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring jpath) {
     const char* str = env->GetStringUTFChars(jpath, nullptr);
@@ -13117,9 +13278,10 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     g_suppressTextRasterRequests = true;
 
     // Cached thumbnail FBO + color attachment (resized when dimensions
-    // change). Static is fine — only used from the GL thread.
-    static GLuint thumbFbo = 0, thumbTex = 0;
-    static int thumbW = 0, thumbH = 0;
+    // change). Globals rather than function statics so
+    // resetForNewGlContext can forget them. GL thread only.
+    GLuint& thumbFbo = g_thumbFbo; GLuint& thumbTex = g_thumbTex;
+    int& thumbW = g_thumbW; int& thumbH = g_thumbH;
     if (thumbW != w || thumbH != h) {
         if (thumbFbo) { glDeleteFramebuffers(1, &thumbFbo); thumbFbo = 0; }
         if (thumbTex) { glDeleteTextures(1, &thumbTex);     thumbTex = 0; }
