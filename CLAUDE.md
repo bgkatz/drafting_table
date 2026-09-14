@@ -135,7 +135,7 @@ The doc is mathematically infinite, but `setPageBounds(x0, y0, x1, y1)` defines 
 
 Default page bounds = initial surface dimensions, set once from `onSizeChanged`.
 
-The size is per document (`<docDir>/page_size.txt`, shared by every page) and shown in the status bar's `canvas · W × H` chip; tapping it opens the new-document size picker in resize mode (`showPageSizeDialog` / `applyCanvasSize`). A resize is anchored at the origin, non-destructive, and not undoable: tiles past a shrunk edge are kept on disk and merely hidden — the tile compositor (`kCompFS`) discards outside the page like the dab/line/grid/text programs do — so growing again reveals them. `refreshSizeChip` post()s its setText because the launch-time caller runs inside `onSizeChanged` (mid-layout), where a synchronous setText leaves the chip at its placeholder width.
+The size is per document (`<docDir>/page_size.txt`, shared by every page) and shown in the status bar's `canvas · W × H` chip; tapping or long-pressing it opens the new-document size picker in resize mode (`showPageSizeDialog` / `applyCanvasSize`). A resize is anchored at the origin, non-destructive, and not undoable: tiles past a shrunk edge are kept on disk and merely hidden — the tile compositor (`kCompFS`) discards outside the page like the dab/line/grid/text programs do — so growing again reveals them. `refreshSizeChip` post()s its setText because the launch-time caller runs inside `onSizeChanged` (mid-layout), where a synchronous setText leaves the chip at its placeholder width.
 
 ### Page setup (grid + margins)
 

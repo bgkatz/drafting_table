@@ -2785,9 +2785,15 @@ class MainActivity : AppCompatActivity() {
         // new-document flow uses, in resize mode — the page is anchored
         // at the origin, so a resize just crops or extends the paper
         // and every stroke stays where it is.
+        // Long-press opens it the same way the grid / margin chips open
+        // their config (fires at the long-press timeout, on pen-down
+        // hold); a plain tap opens it too since there's nothing to
+        // toggle. Returning true from the long-click suppresses the
+        // trailing click so the dialog doesn't open twice.
         statusSizeText = makeStatusText(sizeChipLabel()).apply {
             isClickable = true; isFocusable = true
             setOnClickListener { userResizeCanvas() }
+            setOnLongClickListener { userResizeCanvas(); true }
         }
         statusToolText = makeStatusText("◇ ${currentToolMirror.displayName.lowercase()}")
         // grid/snap texts double as toggles. Tap to flip; the active
