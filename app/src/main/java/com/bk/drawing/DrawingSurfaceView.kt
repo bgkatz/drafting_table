@@ -644,20 +644,42 @@ class DrawingSurfaceView @JvmOverloads constructor(
     /** Frame the page rect in the visible canvas area. If page bounds
      *  aren't set we fall back to identity (the doc behaves as an
      *  infinite plane in that mode and there's no natural "frame"). */
+    /** Scale at which the whole page fits the visible canvas region
+     *  (the SurfaceView minus the left-side overlay). Null when there's
+     *  no page rect or no layout yet. */
+    private fun pageFitScale(): Float? {
+        val pageW = NativeRenderer.getPageWidth()
+        val pageH = NativeRenderer.getPageHeight()
+        if (pageW <= 0 || pageH <= 0 || width <= 0 || height <= 0) return null
+        val avail  = (width - visibleLeftInset).toFloat()
+        val availH = height.toFloat()
+        return minOf(avail / pageW, availH / pageH).coerceAtLeast(0.01f)
+    }
+
+    /** Lower bound for the pinch scale. The fixed floor protects small
+     *  pages from being zoomed into a speck (and the bake from
+     *  materialising tiles across huge doc distances per finger
+     *  movement), but it must never sit above what a large page needs
+     *  to be seen whole — so it drops to a fraction of the fit scale
+     *  when the page is big enough that fit-to-screen is below it. */
+    private fun minViewScale(): Float {
+        val fit = pageFitScale() ?: return kMinViewScale
+        return minOf(kMinViewScale, fit * kMinZoomFitFraction)
+    }
+
     fun resetView() {
         val pageW = NativeRenderer.getPageWidth()
         val pageH = NativeRenderer.getPageHeight()
         viewRotation = 0f
-        if (pageW > 0 && pageH > 0 && width > 0 && height > 0) {
+        val fit = pageFitScale()
+        if (fit != null) {
             // Visible canvas region after subtracting the left-side
             // overlay (sidebar + layer panel). Page is fitted edge-to-
             // edge — the dominant axis hits the visible bounds exactly,
             // and the orthogonal axis centers the leftover slack.
             val avail  = (width - visibleLeftInset).toFloat()
             val availH = height.toFloat()
-            val sx = avail  / pageW.toFloat()
-            val sy = availH / pageH.toFloat()
-            val s  = minOf(sx, sy).coerceAtLeast(0.01f)
+            val s = fit
             viewScale = s
             // Center the scaled page within the visible region. The
             // doc→view mapping is view = scale*doc + viewPan, so the
@@ -1159,7 +1181,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // and the stroke bake then has to materialize a tile FBO for every
         // cell along the way — which can OOM the GPU.
         val rawScale    = (viewLen / docLen).toFloat()
-        val newScale    = rawScale.coerceIn(kMinViewScale, kMaxViewScale)
+        val newScale    = rawScale.coerceIn(minViewScale(), kMaxViewScale)
         val newRotation = (atan2(viewDy, viewDx) - atan2(docDy, docDx)).toFloat()
         val c = cos(newRotation); val s = sin(newRotation)
         val newPanX = v1x - newScale * (c * gestureP1DocX - s * gestureP1DocY)
@@ -1178,9 +1200,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
         /** View-px the pen must travel before a TEXT tap becomes a
          *  drag-to-place. */
         const val kTextDragSlopPx = 14f
-        // Limits on the gesture-driven view scale.
+        // Limits on the gesture-driven view scale. The floor is the
+        // smaller of kMinViewScale and (fit-to-screen × fraction) — see
+        // minViewScale() — so a large page can always be zoomed out to
+        // show the whole sheet with room around it.
         const val kMinViewScale = 0.25f
         const val kMaxViewScale = 8.0f
+        const val kMinZoomFitFraction = 0.5f
         // Trailing-edge debounce window for the deferred thumbnail refresh.
         const val kThumbnailDeferMs = 250L
     }

@@ -3332,6 +3332,7 @@ class MainActivity : AppCompatActivity() {
         var scale: Int = 1,               // PNG only
         var transparent: Boolean = false, // PNG only
         var guides: Boolean = true,
+        var dpi: Int = kExportDpiDefault, // PDF only: doc-px per inch
     )
     private val exportOpts = ExportOptions()
 
@@ -3339,6 +3340,7 @@ class MainActivity : AppCompatActivity() {
     private class ExportPlan(
         val pages: List<Int>, val format: String, val scale: Int,
         val transparent: Boolean, val guides: Boolean, val docName: String,
+        val dpi: Int,
     )
     private var pendingExport: ExportPlan? = null
 
@@ -3354,6 +3356,8 @@ class MainActivity : AppCompatActivity() {
         exportOpts.scale = p.getInt("export_scale", 1).coerceIn(1, 3)
         exportOpts.transparent = p.getBoolean("export_transparent", false)
         exportOpts.guides = p.getBoolean("export_guides", true)
+        exportOpts.dpi = p.getInt("export_dpi", kExportDpiDefault)
+            .coerceIn(kExportDpiMin, kExportDpiMax)
         // Pages always start back at "current" — a stale range is a
         // surprise, the other settings are preferences.
         exportOpts.scope = "current"
@@ -3365,7 +3369,29 @@ class MainActivity : AppCompatActivity() {
             .putInt("export_scale", exportOpts.scale)
             .putBoolean("export_transparent", exportOpts.transparent)
             .putBoolean("export_guides", exportOpts.guides)
+            .putInt("export_dpi", exportOpts.dpi)
             .apply()
+    }
+
+    /** PDF page scale. The size presets (Letter 1700 × 2200, A4
+     *  1654 × 2339) are 200 dpi sizes, so that's the default — a
+     *  Letter doc then comes out as a real 8.5 × 11 in page instead
+     *  of the 23.6 × 30.6 in that 1 px = 1 pt would give. */
+    private companion object {
+        const val kExportDpiDefault = 200
+        const val kExportDpiMin = 36
+        const val kExportDpiMax = 1200
+        val kExportDpiPresets = listOf(72, 150, 200, 300)
+    }
+
+    /** "8.50 × 11.00 in · 216 × 279 mm" for the current page at [dpi]. */
+    private fun physicalPageSizeLabel(dpi: Int): String {
+        val pw = NativeRenderer.getPageWidth()
+        val ph = NativeRenderer.getPageHeight()
+        if (pw <= 0 || ph <= 0 || dpi <= 0) return ""
+        val win = pw / dpi.toFloat(); val hin = ph / dpi.toFloat()
+        return String.format(java.util.Locale.US,
+            "%.2f × %.2f in  ·  %.0f × %.0f mm", win, hin, win * 25.4f, hin * 25.4f)
     }
 
     /** "1-3, 7" → sorted distinct 0-based indices within the document. */
@@ -3472,12 +3498,63 @@ class MainActivity : AppCompatActivity() {
         val guidesRow = chipRow("guides", listOf("include", "hide"),
             { if (exportOpts.guides) 0 else 1 }) { exportOpts.guides = it == 0 }
 
+        // PDF page scale: preset chips plus a "custom" chip that reveals
+        // a number field (same pattern as the page range). The readout
+        // under it shows the physical page size the PDF will declare,
+        // so a Letter doc visibly reads 8.50 × 11.00 in at 200 dpi.
+        var dpiCustom = exportOpts.dpi !in kExportDpiPresets
+        val dpiInput = android.widget.EditText(this).apply {
+            setText(exportOpts.dpi.toString())
+            hint = "dpi"
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(4))
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(ink)
+            backgroundTintList = android.content.res.ColorStateList.valueOf(inkSoft)
+            isSingleLine = true
+        }
+        val dpiRow = chipRow("dpi", kExportDpiPresets.map { it.toString() } + "custom",
+            { if (dpiCustom) kExportDpiPresets.size
+              else kExportDpiPresets.indexOf(exportOpts.dpi) }) { i ->
+            dpiCustom = i == kExportDpiPresets.size
+            if (!dpiCustom) {
+                exportOpts.dpi = kExportDpiPresets[i]
+                dpiInput.setText(exportOpts.dpi.toString())
+            }
+        }
+        val sizeReadout = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(inkSoft)
+        }
+        /** Custom field → exportOpts.dpi (clamped; blank keeps the last
+         *  value so the readout never goes stale mid-edit). */
+        fun syncCustomDpi() {
+            if (!dpiCustom) return
+            dpiInput.text.toString().toIntOrNull()
+                ?.coerceIn(kExportDpiMin, kExportDpiMax)
+                ?.let { exportOpts.dpi = it }
+        }
+        dpiInput.addTextChangedListener(object : android.text.TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+            override fun afterTextChanged(s: android.text.Editable?) {
+                syncCustomDpi()
+                sizeReadout.text = physicalPageSizeLabel(exportOpts.dpi)
+            }
+        })
+
         refreshAll = {
             for (r in refreshers) r()
             val png = exportOpts.format == "png"
             scaleRow.visibility = if (png) View.VISIBLE else View.GONE
             bgRow.visibility = if (png) View.VISIBLE else View.GONE
             rangeInput.visibility = if (exportOpts.scope == "range") View.VISIBLE else View.GONE
+            dpiRow.visibility = if (png) View.GONE else View.VISIBLE
+            dpiInput.visibility = if (!png && dpiCustom) View.VISIBLE else View.GONE
+            sizeReadout.visibility = if (png) View.GONE else View.VISIBLE
+            sizeReadout.text = physicalPageSizeLabel(exportOpts.dpi)
         }
 
         val wrap = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
@@ -3490,6 +3567,13 @@ class MainActivity : AppCompatActivity() {
         container.addView(scaleRow, wrap)
         container.addView(bgRow, wrap)
         container.addView(guidesRow, wrap)
+        container.addView(dpiRow, wrap)
+        container.addView(dpiInput, LinearLayout.LayoutParams(
+            120.dp, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = 96.dp })
+        container.addView(sizeReadout, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { leftMargin = 96.dp; topMargin = 2.dp; bottomMargin = 4.dp })
 
         // Cancel | Share | Save
         val (buttons, cancelBtn, saveBtn) = makePaperDialogButtons("Save")
@@ -3512,6 +3596,7 @@ class MainActivity : AppCompatActivity() {
         cancelBtn.setOnClickListener { dialog.dismiss() }
         val go = { share: Boolean ->
             exportOpts.range = rangeInput.text.toString()
+            syncCustomDpi()
             dialog.dismiss()
             startExport(share)
         }
@@ -3529,7 +3614,8 @@ class MainActivity : AppCompatActivity() {
         saveExportOptions()
         val plan = ExportPlan(pages, exportOpts.format, exportOpts.scale,
                               exportOpts.transparent, exportOpts.guides,
-                              currentDocName.ifBlank { "Untitled" })
+                              currentDocName.ifBlank { "Untitled" },
+                              exportOpts.dpi)
         if (share) { runExport(plan, ExportSink.Share); return }
         when {
             plan.format == "pdf" -> {
@@ -3677,10 +3763,21 @@ class MainActivity : AppCompatActivity() {
                 val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
                 v.queueExportRender(listOf(DrawingSurfaceView.ExportPage(pageIdx, bmp))) {
                     try {
+                        // PDF points are 1/72 in; the page bitmap is
+                        // doc-px, so the page is (px * 72 / dpi) pt and
+                        // the canvas is scaled to match. The bitmap is
+                        // embedded at full resolution regardless —
+                        // only its placement changes — and the text is
+                        // drawn as vectors under the same scale.
+                        val k = 72f / plan.dpi.coerceAtLeast(1)
+                        val wPt = Math.round(w * k).coerceAtLeast(1)
+                        val hPt = Math.round(h * k).coerceAtLeast(1)
                         val info = android.graphics.pdf.PdfDocument.PageInfo
-                            .Builder(w, h, i + 1).create()
+                            .Builder(wPt, hPt, i + 1).create()
                         val page = pdf!!.startPage(info)
-                        page.canvas.drawBitmap(bmp, 0f, 0f, null)
+                        page.canvas.scale(k, k)
+                        page.canvas.drawBitmap(bmp, 0f, 0f,
+                            android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG))
                         TextLayout.drawPageTextToCanvas(this, page.canvas, pageIdx, ts, tox, toy)
                         pdf.finishPage(page)
                         bmp.recycle()
