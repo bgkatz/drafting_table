@@ -233,12 +233,14 @@ void main() {
 const char* kCompVS = R"(#version 300 es
 layout(location = 0) in vec2 aQuad;
 out vec2 vUv;
+out vec2 vDocPos;
 uniform mat4  uTransform;
 uniform vec2  uScreen;
 uniform vec2  uTileCenter;
 uniform float uTileHalf;
 void main() {
-    vec2 viewPx = uTileCenter + aQuad * uTileHalf;
+    vec2 viewPx = uTileCenter + aQuad * uTileHalf;   // doc-px, despite the name
+    vDocPos = viewPx;
     vec4 bufPx  = uTransform * vec4(viewPx, 0.0, 1.0);
     vec2 ndc = (bufPx.xy / uScreen) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
@@ -249,12 +251,20 @@ void main() {
 const char* kCompFS = R"(#version 300 es
 precision mediump float;
 in vec2 vUv;
+in vec2 vDocPos;
 out vec4 outColor;
 uniform sampler2D uTileTex;
 // Per-layer opacity (1.0 = fully opaque). Multiplying a premultiplied
 // RGBA by a scalar yields a correctly-premultiplied RGBA at the
 // scaled alpha — that's why we don't need separate rgb / a math.
 uniform float uOpacity;
+// Page clip. Tiles are never *created* outside the page, but a page
+// that was later shrunk (canvas-size dialog) can still own tiles past
+// its new edge; discarding here keeps that content hidden — not
+// deleted — so growing the page again brings it back.
+uniform vec2  uPageMin;
+uniform vec2  uPageMax;
+uniform int   uPageActive;
 // Apron-aware UV remap. The tile texture is 258x258 with the visible
 // 256x256 content at texels [1..256]; the outer 1-pixel ring is filled
 // from neighbors so LINEAR sampling near the edge can blend across
@@ -263,6 +273,11 @@ uniform float uOpacity;
 const float kApronTex = 1.0 / 258.0;
 const float kInner    = 256.0 / 258.0;
 void main() {
+    if (uPageActive != 0 && (
+        vDocPos.x < uPageMin.x || vDocPos.x > uPageMax.x ||
+        vDocPos.y < uPageMin.y || vDocPos.y > uPageMax.y)) {
+        discard;
+    }
     vec2 uv = vUv * kInner + kApronTex;
     outColor = texture(uTileTex, uv) * uOpacity;
 }
@@ -1161,6 +1176,9 @@ struct CompProg {
     GLint  uTileHalf   = -1;
     GLint  uTileTex    = -1;
     GLint  uOpacity    = -1;
+    GLint  uPageMin    = -1;
+    GLint  uPageMax    = -1;
+    GLint  uPageActive = -1;
 };
 
 struct PreviewProg {
@@ -3090,6 +3108,9 @@ void ensureInited() {
     g_comp.uTileHalf   = glGetUniformLocation(g_comp.program, "uTileHalf");
     g_comp.uTileTex    = glGetUniformLocation(g_comp.program, "uTileTex");
     g_comp.uOpacity    = glGetUniformLocation(g_comp.program, "uOpacity");
+    g_comp.uPageMin    = glGetUniformLocation(g_comp.program, "uPageMin");
+    g_comp.uPageMax    = glGetUniformLocation(g_comp.program, "uPageMax");
+    g_comp.uPageActive = glGetUniformLocation(g_comp.program, "uPageActive");
 
     g_preview.program   = linkProgram(kPreviewVS, kPreviewFS);
     g_preview.uBelow    = glGetUniformLocation(g_preview.program, "uBelow");
@@ -6923,6 +6944,12 @@ void bindRasterCompositePipeline(JNIEnv* env, jint width, jint height,
     // their draw calls and we don't bother resetting on the way out
     // because the composite program isn't used by any non-layer pass.
     glUniform1f(g_comp.uOpacity, 1.0f);
+    // Doc-space page clip, so tiles left behind by a since-shrunk page
+    // don't paint past the outline. Every caller (screen composite,
+    // thumbnails/export, eraser-preview snapshot, bucket-fill boundary
+    // image) wants the same truncation the bake already applies.
+    uploadPageClip(g_comp.uPageMin, g_comp.uPageMax,
+                   g_comp.uPageActive, readPageClip());
 }
 
 void compositeRasterLayer(const Layer& layer, float opacityOverride) {

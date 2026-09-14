@@ -135,6 +135,8 @@ The doc is mathematically infinite, but `setPageBounds(x0, y0, x1, y1)` defines 
 
 Default page bounds = initial surface dimensions, set once from `onSizeChanged`.
 
+The size is per document (`<docDir>/page_size.txt`, shared by every page) and shown in the status bar's `canvas · W × H` chip; tapping it opens the new-document size picker in resize mode (`showPageSizeDialog` / `applyCanvasSize`). A resize is anchored at the origin, non-destructive, and not undoable: tiles past a shrunk edge are kept on disk and merely hidden — the tile compositor (`kCompFS`) discards outside the page like the dab/line/grid/text programs do — so growing again reveals them. `refreshSizeChip` post()s its setText because the launch-time caller runs inside `onSizeChanged` (mid-layout), where a synchronous setText leaves the chip at its placeholder width.
+
 ### Page setup (grid + margins)
 
 Grid on/off/style, grid spacing, and the margin rules are **per-document**, stored in `<docDir>/page_setup.txt` as `key=value` lines (`grid`, `grid_spacing`, `margins`, `margin_top`, `margin_side`) next to `page_size.txt`. `loadPageSetup` runs on every doc switch and at startup; a doc with no file inherits the currently active setup and gets the file written. Native mirrors are atomics (`g_gridSpacing`, `g_marginEnabled`, `g_marginTop/Side`) read at composite time; `g_gridSpacing` is also the grid-snap pitch. Margins are rose line segments (top/bottom share `margin_top`, left/right share `margin_side`) drawn right after the grid in both `compositeAllLayers` and the eraser-preview "below" snapshot, so they behave exactly like the grid (under the layers, exported). The status-bar chips toggle on tap and open a slider popup on long-press (`showPaperSliderPopup`).

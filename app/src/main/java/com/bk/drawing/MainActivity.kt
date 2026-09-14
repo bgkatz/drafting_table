@@ -113,6 +113,7 @@ class MainActivity : AppCompatActivity() {
     // ---- Status bar -----------------------------------------------------
     private lateinit var statusToolText:  TextView
     private lateinit var statusDocText:   TextView
+    private lateinit var statusSizeText:  TextView
     private lateinit var statusGridText:    TextView
     private lateinit var statusMarginText:  TextView
     private lateinit var textEditor: TextEditController
@@ -2581,8 +2582,15 @@ class MainActivity : AppCompatActivity() {
     private fun thumbDimensions(): Pair<Int, Int> {
         val maxW = kThumbMaxWidthDp.dp
         val maxH = kThumbMaxHeightDp.dp
-        val pageW = drawingView?.width ?: 0
-        val pageH = drawingView?.height ?: 0
+        // Page aspect, so a Letter-portrait doc gets a portrait thumb
+        // instead of a letterboxed landscape one. Falls back to the
+        // surface dims before the page rect is known.
+        var pageW = NativeRenderer.getPageWidth()
+        var pageH = NativeRenderer.getPageHeight()
+        if (pageW <= 0 || pageH <= 0) {
+            pageW = drawingView?.width ?: 0
+            pageH = drawingView?.height ?: 0
+        }
         if (pageW <= 0 || pageH <= 0) return Pair(maxW, maxH)
         val aspect = pageH.toFloat() / pageW.toFloat()
         return if (maxW * aspect <= maxH) {
@@ -2773,6 +2781,14 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.0f))
 
         statusDocText  = makeStatusText("doc · $currentDocName")
+        // Canvas size in doc-px. Tap opens the same size picker the
+        // new-document flow uses, in resize mode — the page is anchored
+        // at the origin, so a resize just crops or extends the paper
+        // and every stroke stays where it is.
+        statusSizeText = makeStatusText(sizeChipLabel()).apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { userResizeCanvas() }
+        }
         statusToolText = makeStatusText("◇ ${currentToolMirror.displayName.lowercase()}")
         // grid/snap texts double as toggles. Tap to flip; the active
         // state colors them with the same hot accent the rail's active
@@ -2849,6 +2865,7 @@ class MainActivity : AppCompatActivity() {
         statusPageText = makeStatusText("page —")
 
         bar.addView(statusDocText,    statusItemLp())
+        bar.addView(statusSizeText,   statusItemLp())
         bar.addView(statusToolText,   statusItemLp())
         bar.addView(statusGridText,   statusItemLp())
         bar.addView(statusMarginText, statusItemLp())
@@ -4379,6 +4396,8 @@ class MainActivity : AppCompatActivity() {
             ?: nextUntitledName()
         currentDocName = initialDoc
         rememberDocName(initialDoc)
+        // The status bar is built before this runs, with an empty name.
+        if (::statusDocText.isInitialized) statusDocText.text = "doc · $initialDoc"
         val docDir = docDirFor(initialDoc).apply { mkdirs() }
         NativeRenderer.setDocumentDir(docDir.absolutePath)
         loadPageSetup(docDir)
@@ -4486,6 +4505,7 @@ class MainActivity : AppCompatActivity() {
             size = Pair(w, h)
         }
         NativeRenderer.setPageBounds(0f, 0f, size.first.toFloat(), size.second.toFloat())
+        refreshSizeChip()
         currentDocName = name
         rememberDocName(name)
         loadPageSetup(dir)
@@ -4504,19 +4524,28 @@ class MainActivity : AppCompatActivity() {
     /** Open the new-document size dialog, then create the doc with the
      *  chosen size. Cancel falls back to no-op (no document is created). */
     private fun userNewDocument() {
-        showNewDocumentSizeDialog { size ->
+        showPageSizeDialog(title = "NEW DOCUMENT", confirmLabel = "Create",
+                           current = null) { size ->
             switchToDocument(nextUntitledName(), size)
         }
     }
 
-    /** Build and show the new-document size picker. Presets cover the
-     *  common cases (current device default, US Letter, A4, a 2× hi-res
-     *  default) plus a Custom row for arbitrary dimensions. The chosen
-     *  size is delivered to [onPick]; Cancel does nothing. */
-    private fun showNewDocumentSizeDialog(onPick: (Pair<Int, Int>) -> Unit) {
+    /** Build and show the page size picker, shared by the new-document
+     *  flow and the canvas-size chip. Presets cover the common cases
+     *  (current device default, US Letter, A4, a 2× hi-res default)
+     *  plus a Custom row for arbitrary dimensions. With [current] set
+     *  (resize mode) the matching preset is preselected, or Custom is
+     *  prefilled with those dimensions if none matches. The chosen size
+     *  is delivered to [onPick]; Cancel does nothing. */
+    private fun showPageSizeDialog(
+        title: String, confirmLabel: String, current: Pair<Int, Int>?,
+        onPick: (Pair<Int, Int>) -> Unit,
+    ) {
         val v = drawingView
         val defaultW = (v?.width  ?: 1024).coerceAtLeast(1)
         val defaultH = (v?.height ?: 1024).coerceAtLeast(1)
+        val customW = current?.first  ?: defaultW
+        val customH = current?.second ?: defaultH
 
         // (label, w, h) — null entry = the Custom row.
         data class Preset(val label: String, val w: Int, val h: Int)
@@ -4545,19 +4574,24 @@ class MainActivity : AppCompatActivity() {
         // Title row, styled like the layer/brush/color section headers
         // elsewhere in the app — small monospace caps with a hairline
         // letter-space.
-        val title = TextView(this).apply {
-            text = "NEW DOCUMENT"
+        val titleView = TextView(this).apply {
+            text = title
             typeface = fontMonoSemibold ?: Typeface.MONOSPACE
             textSize = 11f
             letterSpacing = 0.08f
             setTextColor(ink)
         }
-        container.addView(title, LinearLayout.LayoutParams(
+        container.addView(titleView, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.WRAP_CONTENT).apply { bottomMargin = 14.dp })
 
         // Selected preset index (or null if Custom is being edited).
-        var selectedIdx: Int? = 0
+        // Resize mode starts on whichever preset matches the current
+        // size, else on Custom (prefilled below).
+        var selectedIdx: Int? = if (current == null) 0 else {
+            presets.indexOfFirst { it.w == current.first && it.h == current.second }
+                .takeIf { it >= 0 }
+        }
         val radioGroup = android.widget.RadioGroup(this).apply {
             orientation = LinearLayout.VERTICAL
         }
@@ -4568,7 +4602,7 @@ class MainActivity : AppCompatActivity() {
                 textSize = 12f
                 setTextColor(ink)
                 buttonTintList = android.content.res.ColorStateList.valueOf(ink)
-                isChecked = (i == 0)
+                isChecked = (i == selectedIdx)
                 radioGroup.addView(this, LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -4581,6 +4615,7 @@ class MainActivity : AppCompatActivity() {
             textSize = 12f
             setTextColor(ink)
             buttonTintList = android.content.res.ColorStateList.valueOf(ink)
+            isChecked = (selectedIdx == null)
             radioGroup.addView(this, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -4595,7 +4630,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(28.dp, 0, 0, 0)
         }
         val widthEdit = android.widget.EditText(this).apply {
-            setText(defaultW.toString())
+            setText(customW.toString())
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
             isSingleLine = true
             filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(5))
@@ -4604,7 +4639,7 @@ class MainActivity : AppCompatActivity() {
             backgroundTintList = android.content.res.ColorStateList.valueOf(inkSoft)
         }
         val heightEdit = android.widget.EditText(this).apply {
-            setText(defaultH.toString())
+            setText(customH.toString())
             inputType = android.text.InputType.TYPE_CLASS_NUMBER
             isSingleLine = true
             filters = arrayOf<android.text.InputFilter>(android.text.InputFilter.LengthFilter(5))
@@ -4668,7 +4703,7 @@ class MainActivity : AppCompatActivity() {
             isClickable = true; isFocusable = true
         }
         val createBtn = TextView(this).apply {
-            text = "Create"
+            text = confirmLabel
             typeface = fontMonoSemibold ?: Typeface.MONOSPACE
             textSize = 12f
             setTextColor(hot)            // sienna accent — primary action
@@ -4793,6 +4828,55 @@ class MainActivity : AppCompatActivity() {
             Pair(surfaceW, surfaceH)
         }
         NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())
+        refreshSizeChip()
+        drawingView?.post { drawingView?.resetView() }
+    }
+
+    // ---- Canvas size (status chip) --------------------------------------
+
+    private fun sizeChipLabel(): String {
+        val w = NativeRenderer.getPageWidth()
+        val h = NativeRenderer.getPageHeight()
+        return if (w > 0 && h > 0) "canvas · $w × $h" else "canvas · —"
+    }
+
+    /** post()ed because the launch-time caller (applyInitialPageBounds)
+     *  runs inside the surface's onSizeChanged, i.e. mid-layout — a
+     *  setText there gets its relayout dropped and the chip keeps the
+     *  width it had for the placeholder text, hiding the numbers. */
+    private fun refreshSizeChip() {
+        if (!::statusSizeText.isInitialized) return
+        statusSizeText.post { statusSizeText.text = sizeChipLabel() }
+    }
+
+    /** Tap on the canvas-size chip: reopen the size picker in resize
+     *  mode with the current dimensions prefilled. */
+    private fun userResizeCanvas() {
+        val cur = Pair(NativeRenderer.getPageWidth(), NativeRenderer.getPageHeight())
+        showPageSizeDialog(
+            title = "CANVAS SIZE", confirmLabel = "Apply",
+            current = if (cur.first > 0 && cur.second > 0) cur else null,
+        ) { size -> applyCanvasSize(size.first, size.second) }
+    }
+
+    /** Resize the current document's page rect to [w] × [h] doc-px.
+     *  Non-destructive and un-undoable by design: the page is anchored
+     *  at the origin, so content keeps its doc-px position; a shrink
+     *  merely hides what now lies outside the rect (the compositor
+     *  clips to the page), and growing again reveals it. The size is
+     *  per document, so every page in the doc follows. */
+    private fun applyCanvasSize(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        if (w == NativeRenderer.getPageWidth() && h == NativeRenderer.getPageHeight()) return
+        if (::textEditor.isInitialized) textEditor.commitIfOpen()
+        writePageSize(docDirFor(currentDocName), w, h)
+        NativeRenderer.setPageBounds(0f, 0f, w.toFloat(), h.toFloat())
+        refreshSizeChip()
+        // Thumbnails are sized from the page aspect, so rebuild the
+        // sidebar (fresh bitmaps) rather than just re-rendering into
+        // the old ones.
+        lastBuiltPageCount = -1
+        drawingView?.forceRedraw()
         drawingView?.post { drawingView?.resetView() }
     }
 
