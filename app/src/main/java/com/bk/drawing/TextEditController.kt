@@ -400,9 +400,14 @@ class TextEditController(
     private fun applyStyle() {
         val et = editText ?: return
         val box = editing ?: return
-        val s = view.currentViewScale
+        // The overlay lays out in doc px with the raster's exact paint
+        // (see TextLayout.paint) and is then scaled as a View, so its
+        // line breaks, line heights and glyph advances are the raster's
+        // — instead of a second layout at screen px that wraps and
+        // spaces differently while the caret is showing.
+        et.paint.flags = et.paint.flags or TextLayout.kPaintFlags
         et.typeface = FontRegistry.typeface(ctx, box.fontKey, box.bold, box.italic)
-        et.setTextSize(TypedValue.COMPLEX_UNIT_PX, box.fontSize * s)
+        et.setTextSize(TypedValue.COMPLEX_UNIT_PX, box.fontSize)
         et.setLineSpacing(0f, box.lineSpacing)
         et.setTextColor((0xFF shl 24) or (box.color and 0xFFFFFF))
         et.gravity = when (box.align) {
@@ -419,14 +424,16 @@ class TextEditController(
         val et = editText ?: return
         val box = editing ?: return
         val s = view.currentViewScale
-        // Re-apply the size in case the zoom changed.
-        et.setTextSize(TypedValue.COMPLEX_UNIT_PX, box.fontSize * s)
+        // Doc-px layout, zoom applied as a View scale about the top-left
+        // pivot (set in openOverlay) — see applyStyle.
+        et.scaleX = s
+        et.scaleY = s
         val lp = et.layoutParams as FrameLayout.LayoutParams
         lp.width = if (box.autoWidth) ViewGroup.LayoutParams.WRAP_CONTENT
-                   else max(ceil(box.w * s).toInt(), 1)
+                   else TextLayout.layoutWidthDoc(box)
         lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
         et.layoutParams = lp
-        et.minWidth = if (box.autoWidth) ceil(box.fontSize * s).toInt() else 0
+        et.minWidth = if (box.autoWidth) ceil(box.fontSize).toInt() else 0
 
         // Rotated top-left of the box in doc px, then to view px.
         val cx = box.x + box.w * 0.5f
@@ -552,6 +559,19 @@ class TextEditController(
     private class OverlayEditText(ctx: Context) : EditText(ctx) {
         var onBackPressed: (() -> Unit)? = null
         var onSelectionChangedCb: (() -> Unit)? = null
+        /** The overlay is laid out in doc px and scaled as a View, so
+         *  its unscaled size can exceed the container's. Left to the
+         *  FrameLayout's AT_MOST specs it gets clipped and then
+         *  scrolls internally to show the caret — the text appears to
+         *  slide up, leaving the bottom of the box blank. Measure
+         *  unbounded instead: the View transform handles fitting. */
+        override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+            fun unbound(spec: Int): Int =
+                if (MeasureSpec.getMode(spec) == MeasureSpec.AT_MOST)
+                    MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED)
+                else spec
+            super.onMeasure(unbound(widthMeasureSpec), unbound(heightMeasureSpec))
+        }
         override fun onSelectionChanged(selStart: Int, selEnd: Int) {
             super.onSelectionChanged(selStart, selEnd)
             onSelectionChangedCb?.invoke()

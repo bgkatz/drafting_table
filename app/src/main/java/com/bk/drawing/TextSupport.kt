@@ -255,7 +255,7 @@ object TextStyling {
  */
 object TextLayout {
     // Mirror of the native constants (kTextRasterMaxDim etc).
-    private const val kMaxTexDim = 2048
+    private const val kMaxTexDim = 4096
     private const val kMinScale = 0.25f
     private const val kMaxScale = 8.0f
     /** Measuring width for auto-width boxes: wide enough that only
@@ -269,13 +269,28 @@ object TextLayout {
         return s
     }
 
-    fun paint(ctx: Context, box: TextBoxModel, scale: Float,
-              tint: Int = Color.WHITE): TextPaint =
-        TextPaint(TextPaint.ANTI_ALIAS_FLAG or TextPaint.SUBPIXEL_TEXT_FLAG).apply {
+    /** Paint flags every text path shares (raster, edit overlay, PDF).
+     *  LINEAR_TEXT turns off hinting so glyph advances scale exactly
+     *  with size — the reason the same layout can be drawn at any zoom
+     *  and the overlay's own layout matches the raster's. */
+    const val kPaintFlags = TextPaint.ANTI_ALIAS_FLAG or
+        TextPaint.SUBPIXEL_TEXT_FLAG or TextPaint.LINEAR_TEXT_FLAG
+
+    /** Layout is always done in doc px (text size = the box's font
+     *  size, wrap width = the box width rounded up to a whole px), so
+     *  line breaks and heights are one fixed answer per box rather
+     *  than a function of the zoom it was last rastered at. Zoom only
+     *  changes the resolution the fixed layout is drawn at. */
+    fun paint(ctx: Context, box: TextBoxModel, tint: Int = Color.WHITE): TextPaint =
+        TextPaint(kPaintFlags).apply {
             typeface = FontRegistry.typeface(ctx, box.fontKey, box.bold, box.italic)
-            textSize = box.fontSize * scale
+            textSize = box.fontSize
             color = tint   // WHITE for coverage-only rasters (native tints)
         }
+
+    /** Wrap width in doc px: an integer, because StaticLayout takes one
+     *  and every consumer must feed it the same number. */
+    fun layoutWidthDoc(box: TextBoxModel): Int = max(1, ceil(box.w).toInt())
 
     fun alignment(align: Int): Layout.Alignment = when (align) {
         1 -> Layout.Alignment.ALIGN_CENTER
@@ -293,11 +308,10 @@ object TextLayout {
             .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
             .build()
 
-    /** Layout at [scale]; for auto-width boxes the width is measured
+    /** Layout in doc px; for auto-width boxes the width is measured
      *  first (widest line) and [box].w is updated to match. */
-    fun layout(ctx: Context, box: TextBoxModel, scale: Float,
-               tint: Int = Color.WHITE): StaticLayout {
-        val p = paint(ctx, box, scale, tint)
+    fun layout(ctx: Context, box: TextBoxModel, tint: Int = Color.WHITE): StaticLayout {
+        val p = paint(ctx, box, tint)
         val text: CharSequence =
             if (box.text.isEmpty()) " "
             else if (box.runs.isEmpty()) box.text
@@ -307,44 +321,43 @@ object TextLayout {
             var maxW = 0f
             for (i in 0 until probe.lineCount) maxW = max(maxW, probe.getLineMax(i))
             // +2 px of slack so float rounding never wraps the last glyph.
-            val wPx = ceil(maxW).toInt() + 2
-            box.w = max(wPx / scale, 16f)
+            box.w = max(ceil(maxW) + 2f, 16f)
         }
-        val widthPx = ceil(box.w * scale).toInt()
-        return build(text, p, widthPx, box.align, box.lineSpacing)
+        return build(text, p, layoutWidthDoc(box), box.align, box.lineSpacing)
     }
 
-    /** Re-flow [box] at the current view scale and update its height
-     *  (and width for auto-width boxes). Returns true if a dimension
-     *  changed by more than a hair. */
-    fun reflow(ctx: Context, box: TextBoxModel, viewScale: Float): Boolean {
-        val scale = desiredScale(viewScale, box.w, box.h)
+    /** Re-flow [box] and update its height (and width for auto-width
+     *  boxes). Returns true if a dimension changed by more than a hair. */
+    fun reflow(ctx: Context, box: TextBoxModel): Boolean {
         val oldW = box.w; val oldH = box.h
-        val l = layout(ctx, box, scale)
-        box.h = max(l.height / scale, 1f)
+        val l = layout(ctx, box)
+        box.h = max(l.height.toFloat(), 1f)
         return kotlin.math.abs(box.h - oldH) > 0.25f || kotlin.math.abs(box.w - oldW) > 0.25f
     }
 
     class Raster(val alpha: ByteArray, val w: Int, val h: Int, val scale: Float,
-                 val channels: Int)
+                 val docW: Float, val channels: Int)
 
-    /** Rasterize [box] at [scale] into an 8-bit coverage bitmap whose
-     *  dimensions are ceil(w*scale) x ceil(h*scale). Also updates the
-     *  box height to the layout's height so the model and the raster
-     *  agree. */
+    /** Rasterize [box] at [scale] texels per doc px: the fixed doc-space
+     *  layout drawn through a scaled canvas into a bitmap of
+     *  ceil(layoutWidth*scale) x ceil(layoutHeight*scale). Also updates
+     *  the box height to the layout's height so the model and the
+     *  raster agree. */
     fun rasterize(ctx: Context, box: TextBoxModel, scale: Float): Raster {
         // Coverage-only (tinted by native) unless some run has its own
         // colour, in which case the raster carries premultiplied RGBA.
         val rgba = box.hasColorRuns()
         val tint = if (rgba) ((0xFF shl 24) or (box.color and 0xFFFFFF)) else Color.WHITE
-        val l = layout(ctx, box, scale, tint)
-        box.h = max(l.height / scale, 1f)
-        val bw = min(max(ceil(box.w * scale).toInt(), 1), kMaxTexDim * 2)
+        val l = layout(ctx, box, tint)
+        box.h = max(l.height.toFloat(), 1f)
+        val docW = layoutWidthDoc(box).toFloat()
+        val bw = min(max(ceil(docW * scale).toInt(), 1), kMaxTexDim * 2)
         val bh = min(max(ceil(box.h * scale).toInt(), 1), kMaxTexDim * 2)
         val channels = if (rgba) 4 else 1
         val bmp = Bitmap.createBitmap(bw, bh,
             if (rgba) Bitmap.Config.ARGB_8888 else Bitmap.Config.ALPHA_8)
         val canvas = Canvas(bmp)
+        canvas.scale(scale, scale)
         l.draw(canvas)
         val rowBytes = bmp.rowBytes
         val buf = ByteBuffer.allocate(rowBytes * bh)
@@ -361,7 +374,7 @@ object TextLayout {
                 System.arraycopy(src, row * rowBytes, out, row * stride, stride)
             }
         }
-        return Raster(out, bw, bh, scale, channels)
+        return Raster(out, bw, bh, scale, docW, channels)
     }
 
     /** Rasterize + hand to native. Returns true if a dimension changed
@@ -370,7 +383,7 @@ object TextLayout {
         val oldW = box.w; val oldH = box.h
         val scale = desiredScale(viewScale, box.w, box.h)
         val r = rasterize(ctx, box, scale)
-        NativeRenderer.uploadTextRaster(box.id, r.scale, r.w, r.h, r.alpha, r.channels)
+        NativeRenderer.uploadTextRaster(box.id, r.scale, r.w, r.h, r.docW, r.alpha, r.channels)
         return kotlin.math.abs(box.h - oldH) > 0.25f || kotlin.math.abs(box.w - oldW) > 0.25f
     }
 
@@ -381,9 +394,9 @@ object TextLayout {
     fun rasterizeAndUploadAt(ctx: Context, box: TextBoxModel, scale: Float) {
         val maxDim = max(box.w, box.h)
         var s = scale.coerceIn(kMinScale, kMaxScale)
-        if (maxDim * s > kMaxTexDim * 2) s = (kMaxTexDim * 2) / maxDim
+        if (maxDim * s > kMaxTexDim) s = kMaxTexDim / maxDim
         val r = rasterize(ctx, box, s)
-        NativeRenderer.uploadTextRaster(box.id, r.scale, r.w, r.h, r.alpha, r.channels)
+        NativeRenderer.uploadTextRaster(box.id, r.scale, r.w, r.h, r.docW, r.alpha, r.channels)
     }
 
     /** A text box read from a page (any page, not just the active one),
@@ -422,14 +435,17 @@ object TextLayout {
         for (p in loadPageBoxes(pageIdx)) {
             if (!p.layerVisible || p.box.text.isEmpty()) continue
             val box = p.box
-            val l = layout(ctx, box, scale, tint = (0xFF shl 24) or (box.color and 0xFFFFFF))
+            val l = layout(ctx, box, tint = (0xFF shl 24) or (box.color and 0xFFFFFF))
             l.paint.alpha = (p.layerOpacity.coerceIn(0f, 1f) * 255f).toInt()
             val cx = box.x + box.w * 0.5f
             val cy = box.y + box.h * 0.5f
             canvas.save()
             canvas.translate(offsetX + cx * scale, offsetY + cy * scale)
             canvas.rotate(Math.toDegrees(box.rotation.toDouble()).toFloat())
-            canvas.translate(-box.w * 0.5f * scale, -box.h * 0.5f * scale)
+            // Same doc-space layout as the screen raster, drawn through
+            // the page's doc→pt scale, so the PDF wraps identically.
+            canvas.scale(scale, scale)
+            canvas.translate(-box.w * 0.5f, -box.h * 0.5f)
             l.draw(canvas)
             canvas.restore()
         }

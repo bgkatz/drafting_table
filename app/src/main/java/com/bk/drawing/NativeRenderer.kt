@@ -196,8 +196,10 @@ object NativeRenderer {
     external fun removeTextBox(id: Int)
 
     /** Hand over an 8-bit coverage bitmap (w*h bytes, row 0 = top)
-     *  rendered at [scale] texels per doc px. */
-    external fun uploadTextRaster(id: Int, scale: Float, w: Int, h: Int,
+     *  rendered at [scale] texels per doc px. [docW] is the wrap width
+     *  the layout used (doc px); native compares it with the box width
+     *  to decide when a resize needs a fresh raster. */
+    external fun uploadTextRaster(id: Int, scale: Float, w: Int, h: Int, docW: Float,
                                   alpha: ByteArray, channels: Int): Boolean
 
     /** Style runs, flattened [start, end, flags, color] per run (flags:

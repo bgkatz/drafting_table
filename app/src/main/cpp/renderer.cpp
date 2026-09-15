@@ -1899,6 +1899,7 @@ struct TextTexture {
     GLuint tex   = 0;
     int    w     = 0, h = 0;   // texels
     float  scale = 1.0f;
+    float  docW  = 0.0f;       // wrap width the layout used, doc px
     int    channels = 1;       // 1 = R8 coverage (tinted), 4 = premultiplied RGBA
 };
 std::unordered_map<uint32_t, TextTexture> g_textTextures;   // GL thread only
@@ -1906,6 +1907,7 @@ struct PendingTextRaster {
     uint32_t             id = 0;
     int                  w = 0, h = 0;
     float                scale = 1.0f;
+    float                docW = 0.0f;   // wrap width the layout used, doc px
     int                  channels = 1;
     std::vector<uint8_t> alpha;   // w*h*channels bytes, row 0 = top
 };
@@ -1923,8 +1925,18 @@ std::unordered_map<uint32_t, TextRasterInfo> g_textRasterScales;
 // whose view scale is not the user's.
 std::atomic<int> g_textRasterNeeded{0};
 bool             g_suppressTextRasterRequests = false;   // GL thread only
-constexpr float  kTextRasterBand   = 1.5f;    // re-raster when scale ratio exceeds this
-constexpr int    kTextRasterMaxDim = 2048;    // texels per side
+// Re-raster when the scale ratio exceeds this. Tight on purpose: the
+// layout is fixed in doc px (TextLayout), so a re-raster only redraws
+// the same lines at the new resolution, and Kotlin defers the work
+// until the pinch ends — so the cost is one raster per box per settled
+// zoom, and the payoff is text that isn't a resampled (softer, heavier)
+// version of itself next to the crisp edit overlay.
+constexpr float  kTextRasterBand   = 1.05f;
+// Texels per side. 4096 so a page-tall box at 1x zoom still gets a
+// 1:1 raster; below that a big box was rendered under screen
+// resolution and magnified, which reads heavier than the edit
+// overlay's crisp text. Mirrored by TextLayout.kMaxTexDim.
+constexpr int    kTextRasterMaxDim = 4096;
 constexpr float  kTextRasterMinScale = 0.25f;
 constexpr float  kTextRasterMaxScale = 8.0f;
 
@@ -6045,11 +6057,10 @@ void applyPendingTextRasters() {
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glGenerateMipmap(GL_TEXTURE_2D);
-        tt.w = p.w; tt.h = p.h; tt.scale = p.scale;
+        tt.w = p.w; tt.h = p.h; tt.scale = p.scale; tt.docW = p.docW;
         {
             std::lock_guard<std::mutex> lock(g_textRasterScaleMutex);
-            g_textRasterScales[p.id] = TextRasterInfo{
-                p.scale, static_cast<float>(p.w) / p.scale };
+            g_textRasterScales[p.id] = TextRasterInfo{ p.scale, p.docW };
         }
     }
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
@@ -7998,8 +8009,7 @@ void drawTextBoxes(JNIEnv* /*env*/, const std::vector<TextBox>& texts,
         bool stale = false;
         if (it != g_textTextures.end() && !g_suppressTextRasterRequests) {
             float want = desiredTextRasterScale(viewScale, t.w, t.h);
-            stale = textRasterStale(it->second.scale,
-                                    static_cast<float>(it->second.w) / it->second.scale,
+            stale = textRasterStale(it->second.scale, it->second.docW,
                                     want, t.w);
         }
         if (it == g_textTextures.end() || stale) {
@@ -11224,7 +11234,7 @@ Java_com_bk_drawing_NativeRenderer_removeTextBox(JNIEnv*, jobject, jint id) {
 JNIEXPORT jboolean JNICALL
 Java_com_bk_drawing_NativeRenderer_uploadTextRaster(
         JNIEnv* env, jobject, jint id, jfloat scale, jint w, jint h,
-        jbyteArray alpha, jint channels) {
+        jfloat docW, jbyteArray alpha, jint channels) {
     if (!alpha || w <= 0 || h <= 0 || w > kTextRasterMaxDim * 2
         || h > kTextRasterMaxDim * 2) return JNI_FALSE;
     if (channels != 1 && channels != 4) return JNI_FALSE;
@@ -11232,7 +11242,7 @@ Java_com_bk_drawing_NativeRenderer_uploadTextRaster(
     if (n != w * h * channels) return JNI_FALSE;
     PendingTextRaster p;
     p.id = static_cast<uint32_t>(id);
-    p.w = w; p.h = h; p.scale = scale;
+    p.w = w; p.h = h; p.scale = scale; p.docW = docW;
     p.channels = channels;
     p.alpha.resize(static_cast<size_t>(n));
     env->GetByteArrayRegion(alpha, 0, n, reinterpret_cast<jbyte*>(p.alpha.data()));
