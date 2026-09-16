@@ -346,8 +346,13 @@ object TextLayout {
     fun rasterize(ctx: Context, box: TextBoxModel, scale: Float): Raster {
         // Coverage-only (tinted by native) unless some run has its own
         // colour, in which case the raster carries premultiplied RGBA.
+        // The coverage raster is drawn in the box's colour too, even
+        // though ALPHA_8 keeps only the alpha: Skia adjusts glyph
+        // coverage by the paint colour's luminance, so drawing white
+        // and tinting black on the GPU got the correction meant for
+        // light text and rendered heavier than the edit overlay.
         val rgba = box.hasColorRuns()
-        val tint = if (rgba) ((0xFF shl 24) or (box.color and 0xFFFFFF)) else Color.WHITE
+        val tint = (0xFF shl 24) or (box.color and 0xFFFFFF)
         val l = layout(ctx, box, tint)
         box.h = max(l.height.toFloat(), 1f)
         val docW = layoutWidthDoc(box).toFloat()

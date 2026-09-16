@@ -589,11 +589,16 @@ uniform vec2 uScreen;
 uniform vec2 uOrigin;
 uniform vec2 uAxisX;
 uniform vec2 uAxisY;
+// Buffer-px nudge that puts the quad's origin on a whole pixel when the
+// raster is 1:1 with the screen (see drawTextBoxes) — texels then land
+// exactly on pixels instead of being bilinearly smeared across two.
+uniform vec2 uSnap;
 void main() {
     vec2 uv  = aQuad * 0.5 + 0.5;
     vec2 doc = uOrigin + uAxisX * uv.x + uAxisY * uv.y;
     vDocPos  = doc;
     vec4 bufPx = uTransform * vec4(doc, 0.0, 1.0);
+    bufPx.xy += uSnap;
     vec2 ndc   = (bufPx.xy / uScreen) * 2.0 - 1.0;
     gl_Position = vec4(ndc, 0.0, 1.0);
     vUv = uv;
@@ -1257,6 +1262,7 @@ struct TextProg {
     GLint  uOrigin     = -1;
     GLint  uAxisX      = -1;
     GLint  uAxisY      = -1;
+    GLint  uSnap       = -1;
     GLint  uTex        = -1;
     GLint  uColor      = -1;
     GLint  uOpacity    = -1;
@@ -3269,6 +3275,7 @@ void ensureInited() {
     g_textProg.uTransform  = glGetUniformLocation(g_textProg.program, "uTransform");
     g_textProg.uScreen     = glGetUniformLocation(g_textProg.program, "uScreen");
     g_textProg.uOrigin     = glGetUniformLocation(g_textProg.program, "uOrigin");
+    g_textProg.uSnap       = glGetUniformLocation(g_textProg.program, "uSnap");
     g_textProg.uAxisX      = glGetUniformLocation(g_textProg.program, "uAxisX");
     g_textProg.uAxisY      = glGetUniformLocation(g_textProg.program, "uAxisY");
     g_textProg.uTex        = glGetUniformLocation(g_textProg.program, "uTex");
@@ -8029,14 +8036,47 @@ void drawTextBoxes(JNIEnv* /*env*/, const std::vector<TextBox>& texts,
         float ox = cx + hx * c - hy * sn;
         float oy = cy + hx * sn + hy * c;
         glUniform2f(g_textProg.uOrigin, ox, oy);
-        glUniform2f(g_textProg.uAxisX, docW * c, docW * sn);
-        glUniform2f(g_textProg.uAxisY, -docH * sn, docH * c);
+        float axX = docW * c,  axY = docW * sn;
+        float ayX = -docH * sn, ayY = docH * c;
+        glUniform2f(g_textProg.uAxisX, axX, axY);
+        glUniform2f(g_textProg.uAxisY, ayX, ayY);
+
+        // Pixel snap. The raster is re-drawn at the exact view scale
+        // once a zoom settles, so at rest its texels are the size of
+        // screen pixels — but the quad's origin sits at a fractional
+        // pixel, and bilinear sampling then blurs every glyph edge
+        // across two pixels, which reads softer and heavier than the
+        // edit overlay's directly-drawn glyphs. When the texture is
+        // 1:1 (within 0.5 %) and the box is axis-aligned on screen
+        // (any multiple of 90°), nudge the origin onto a whole pixel
+        // and sample level 0 only. Rotated or mid-zoom boxes keep the
+        // trilinear path.
+        const float* m = transform;   // column-major doc → buffer
+        float bxX = m[0] * axX + m[4] * axY, bxY = m[1] * axX + m[5] * axY;
+        float byX = m[0] * ayX + m[4] * ayY, byY = m[1] * ayX + m[5] * ayY;
+        float lenX = std::sqrt(bxX * bxX + bxY * bxY);
+        float lenY = std::sqrt(byX * byX + byY * byY);
+        bool oneToOne = std::fabs(lenX / tt.w - 1.0f) < 0.005f
+                     && std::fabs(lenY / tt.h - 1.0f) < 0.005f;
+        bool axisAligned = std::fabs(bxY) < 0.5f || std::fabs(bxX) < 0.5f;
+        float snapX = 0.0f, snapY = 0.0f;
+        if (oneToOne && axisAligned) {
+            float boX = m[0] * ox + m[4] * oy + m[12];
+            float boY = m[1] * ox + m[5] * oy + m[13];
+            snapX = std::round(boX) - boX;
+            snapY = std::round(boY) - boY;
+        }
+        glUniform2f(g_textProg.uSnap, snapX, snapY);
+
         float r = ((t.color >> 16) & 0xFFu) / 255.0f;
         float g = ((t.color >>  8) & 0xFFu) / 255.0f;
         float b = ( t.color        & 0xFFu) / 255.0f;
         glUniform4f(g_textProg.uColor, r, g, b, 1.0f);
         glUniform1i(g_textProg.uMode, tt.channels == 4 ? 1 : 0);
         glBindTexture(GL_TEXTURE_2D, tt.tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        (oneToOne && axisAligned) ? GL_LINEAR
+                                                  : GL_LINEAR_MIPMAP_LINEAR);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
     }
     glBindTexture(GL_TEXTURE_2D, 0);

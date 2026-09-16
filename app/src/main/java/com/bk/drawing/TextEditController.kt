@@ -6,6 +6,7 @@ import android.text.Layout
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -575,6 +576,17 @@ class TextEditController(
         override fun onSelectionChanged(selStart: Int, selEnd: Int) {
             super.onSelectionChanged(selStart, selEnd)
             onSelectionChangedCb?.invoke()
+        }
+        /** Fingers are for view gestures in this app; only the pen
+         *  edits. Declining a finger DOWN makes the container offer it
+         *  to the canvas underneath, so two-finger zoom/pan/rotate
+         *  works over the box being edited — otherwise a box zoomed to
+         *  fill the canvas trapped every gesture. Only DOWN is refused:
+         *  later events of a gesture go to whichever view took DOWN. */
+        override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+            if (ev.actionMasked == MotionEvent.ACTION_DOWN
+                && ev.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER) return false
+            return super.dispatchTouchEvent(ev)
         }
         override fun onKeyPreIme(keyCode: Int, event: KeyEvent): Boolean {
             if (keyCode == KeyEvent.KEYCODE_BACK && event.action == KeyEvent.ACTION_UP) {
