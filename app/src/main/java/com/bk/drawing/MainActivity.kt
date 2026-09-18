@@ -4012,6 +4012,12 @@ class MainActivity : AppCompatActivity() {
         NativeRenderer.cycleActiveLayer()
         activeLayerIndex = (activeLayerIndex + 1) % layerCount
         rebuildLayerList()
+        // The cycle is queued to the GL thread and only lands on the
+        // next render. Without a redraw here the UI-thread hit test of
+        // the next SELECT tap still saw the previous active layer and
+        // selected its shapes; the tap's own redraw then drained the
+        // queue, which is why the second attempt worked.
+        drawingView?.forceRedraw()
     }
 
     private fun userClearLayer() {
@@ -4149,12 +4155,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun userUndo() {
+        // An open text editor is committed first so undo reverts that
+        // edit (and can't pull the box out from under the overlay).
+        if (::textEditor.isInitialized) textEditor.commitIfOpen()
         NativeRenderer.undo()
         drawingView?.forceRedraw()
         drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)
     }
 
     private fun userRedo() {
+        if (::textEditor.isInitialized) textEditor.commitIfOpen()
         NativeRenderer.redo()
         drawingView?.forceRedraw()
         drawingView?.postDelayed({ syncLayerStateFromNative() }, 60L)

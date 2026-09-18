@@ -16,8 +16,10 @@ import android.text.style.UnderlineSpan
 import androidx.core.content.res.ResourcesCompat
 import java.nio.ByteBuffer
 import kotlin.math.ceil
+import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 
 /**
  * Fonts available to text boxes. Each entry is a bundled font family
@@ -140,6 +142,21 @@ data class TextBoxModel(
      *  raster then has to carry colour itself (RGBA) rather than being
      *  tinted by native. */
     fun hasColorRuns(): Boolean = runs.any { it.color != null && it.color != color }
+
+    /** Set the height so that the box's rotated top-left corner stays
+     *  where it is. Rotation is about the box centre, so a plain
+     *  height change on a rotated box swings its top edge; content-
+     *  driven height changes (re-wrap after typing or a resize) should
+     *  read as the text growing downward from a fixed top. */
+    fun setHeightKeepingTop(newH: Float) {
+        val dh = newH - h
+        if (dh != 0f && rotation != 0f) {
+            val c = cos(rotation); val sn = sin(rotation)
+            x -= dh * 0.5f * sn
+            y -= dh * 0.5f * (1f - c)
+        }
+        h = newH
+    }
 
     /** Push the whole state to native. */
     fun pushToNative(undoable: Boolean) {
@@ -331,7 +348,7 @@ object TextLayout {
     fun reflow(ctx: Context, box: TextBoxModel): Boolean {
         val oldW = box.w; val oldH = box.h
         val l = layout(ctx, box)
-        box.h = max(l.height.toFloat(), 1f)
+        box.setHeightKeepingTop(max(l.height.toFloat(), 1f))
         return kotlin.math.abs(box.h - oldH) > 0.25f || kotlin.math.abs(box.w - oldW) > 0.25f
     }
 
@@ -354,7 +371,7 @@ object TextLayout {
         val rgba = box.hasColorRuns()
         val tint = (0xFF shl 24) or (box.color and 0xFFFFFF)
         val l = layout(ctx, box, tint)
-        box.h = max(l.height.toFloat(), 1f)
+        box.setHeightKeepingTop(max(l.height.toFloat(), 1f))
         val docW = layoutWidthDoc(box).toFloat()
         val bw = min(max(ceil(docW * scale).toInt(), 1), kMaxTexDim * 2)
         val bh = min(max(ceil(box.h * scale).toInt(), 1), kMaxTexDim * 2)

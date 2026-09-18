@@ -1956,6 +1956,20 @@ inline bool textRasterStale(float haveScale, float haveDocW,
     if (ratio > kTextRasterBand) return true;
     return std::fabs(haveDocW - boxW) > 1.0f;
 }
+// Mark a box's cached raster stale without dropping it: the compositor
+// keeps drawing the old texture (no blank frame) while raising a
+// re-raster request, and getTextRasterRequests reports the box. Used
+// when the box's content changes behind Kotlin's back (undo / redo of
+// a text edit or style change) — the width/scale test alone can't see
+// that, so undo used to leave the old words on screen. GL thread.
+constexpr float kTextRasterForceStaleDocW = -1.0e9f;
+void markTextRasterStale(uint32_t id) {
+    auto it = g_textTextures.find(id);
+    if (it != g_textTextures.end()) it->second.docW = kTextRasterForceStaleDocW;
+    std::lock_guard<std::mutex> lock(g_textRasterScaleMutex);
+    auto jt = g_textRasterScales.find(id);
+    if (jt != g_textRasterScales.end()) jt->second.docW = kTextRasterForceStaleDocW;
+}
 // Box currently open in the Kotlin edit overlay: the compositor skips
 // it so the overlay is the only visual. 0 = none.
 std::atomic<uint32_t> g_textEditingId{0};
@@ -2692,6 +2706,16 @@ void applyPendingLayerActions() {
             activeLayer() = (activeLayer() + 1) % layers().size();
             LOGI("active layer cycled to %zu/%zu",
                  activeLayer(), layers().size() - 1);
+            // Selection is per-layer: a selection left behind on the
+            // previous layer would still answer handle hits and
+            // tap-inside-OBB moves from beginInteractionAt, so a tap
+            // meant for the new layer grabbed the old shape instead.
+            {
+                std::lock_guard<std::mutex> lock(g_selectionMutex);
+                g_selection = Selection{};
+                g_extraSelections.clear();
+            }
+            g_mbCacheValid = false;
         } else if (a == kActionAddVectorLayer) {
             size_t prevActive = activeLayer();
             auto layer = std::make_unique<Layer>();
@@ -8710,6 +8734,7 @@ void insertShapeAt(Layer& layer, ShapeKind kind, size_t idx, const ShapeData& sd
         case ShapeKind::Text:
             layer.texts.insert(layer.texts.begin()
                 + std::min(idx, layer.texts.size()), sd.text);
+            markTextRasterStale(sd.text.id);
             break;
         case ShapeKind::None:
             break;
@@ -8758,7 +8783,13 @@ void assignShapeAt(Layer& layer, ShapeKind kind, size_t idx, const ShapeData& sd
             if (idx < layer.circles.size())  layer.circles[idx]  = sd.circle;
             break;
         case ShapeKind::Text:
-            if (idx < layer.texts.size())    layer.texts[idx]    = sd.text;
+            if (idx < layer.texts.size()) {
+                layer.texts[idx] = sd.text;
+                // The raster cache is keyed by id and only re-checks
+                // scale / width, so restoring different text, runs or
+                // style would otherwise keep showing the old raster.
+                markTextRasterStale(sd.text.id);
+            }
             break;
         case ShapeKind::None:
             break;
@@ -12016,6 +12047,14 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
         int anchorIdx;
         if (sel.kind == ShapeKind::Line) {
             anchorIdx = (handleHit == 0) ? 1 : 0;
+        } else if (sel.kind == ShapeKind::Text) {
+            // Width-only resize whose height then follows the re-wrap:
+            // anchor the TOP corner on the opposite side (0 = TL,
+            // 1 = TR) whichever handle is dragged, so the text stays
+            // pinned to its top edge. The diagonal anchor pinned the
+            // bottom corner for a top-handle drag, and the top-left
+            // then rode up and down with the wrapped height.
+            anchorIdx = (handleHit == 0 || handleHit == 3) ? 1 : 0;
         } else {
             anchorIdx = (handleHit + 2) % 4;   // diagonally opposite
         }
@@ -12323,9 +12362,13 @@ void applyScaleTo(float x, float y) {
             if (sel.shapeIdx < layer.texts.size()) {
                 auto& t = layer.texts[sel.shapeIdx];
                 float newW = std::max(newHw * 2.0f, kTextMinWidth);
-                int anchorIdx = (d.handleIdx + 2) % 4;
-                float alx = (anchorIdx == 0 || anchorIdx == 3) ? -newW * 0.5f : +newW * 0.5f;
-                float aly = (anchorIdx == 0 || anchorIdx == 1) ? -t.h * 0.5f : +t.h * 0.5f;
+                // Anchor = top corner on the side opposite the dragged
+                // handle (see beginInteractionAt); its local y is the
+                // box top, so the top edge holds and the height change
+                // from the re-wrap grows downward.
+                int anchorIdx = (d.handleIdx == 0 || d.handleIdx == 3) ? 1 : 0;
+                float alx = (anchorIdx == 0) ? -newW * 0.5f : +newW * 0.5f;
+                float aly = -t.h * 0.5f;
                 float c2 = std::cos(t.rotation), s2 = std::sin(t.rotation);
                 float cx = d.anchorX - (alx * c2 - aly * s2);
                 float cy = d.anchorY - (alx * s2 + aly * c2);
