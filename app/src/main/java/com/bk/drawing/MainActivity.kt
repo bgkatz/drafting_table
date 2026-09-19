@@ -96,6 +96,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var brushSizeRow: View
     private lateinit var brushAlphaRow: View
     private lateinit var strokeUniformAlphaRow: View
+    private lateinit var preserveAspectRow: View
     private lateinit var brushHardRow: View
     private lateinit var brushPressRow: View
     // TEXT panel rows (shown for the TEXT tool or a selected text box).
@@ -210,6 +211,7 @@ class MainActivity : AppCompatActivity() {
     // (see Clip Studio's default behavior). Persisted; defaults to off
     // so existing behavior is preserved for users who upgrade.
     private var strokeUniformAlpha = false
+    private var preserveAspect = false
     // Pressure saturation in (0, 1]. Slider value / 100 — see
     // DrawingSurfaceView.brushPressureSaturation for the mapping
     // semantics. 1.0 = full pen range (default), 0.5 = pen maxes out
@@ -223,6 +225,7 @@ class MainActivity : AppCompatActivity() {
     private val kPrefPixelGrid     = "pixel_grid_enabled"
     private val kPrefBrushAlpha    = "brush_alpha"
     private val kPrefStrokeUniformAlpha = "stroke_uniform_alpha"
+    private val kPrefPreserveAspect = "preserve_aspect"
     private val kPrefBrushHardness = "brush_hardness"
     private val kPrefBrushPressure = "brush_pressure_sat"
     private val kPrefBucketBleed   = "bucket_bleed"
@@ -351,6 +354,8 @@ class MainActivity : AppCompatActivity() {
         NativeRenderer.setBrushHardness(brushHardness)
         NativeRenderer.setBucketBleed(bucketBleed)
         NativeRenderer.setStrokeUniformAlpha(strokeUniformAlpha)
+        preserveAspect = prefs().getBoolean(kPrefPreserveAspect, false)
+        NativeRenderer.setPreserveAspectEnabled(preserveAspect)
         // Palm-rejection mode persists across launches; defaults on so
         // accidental finger touches don't draw out of the box.
         stylusOnly = prefs().getBoolean(kPrefStylusOnly, true)
@@ -1470,6 +1475,10 @@ class MainActivity : AppCompatActivity() {
         bucketBleedRow = buildBucketBleedRow()
         container.addView(bucketBleedRow)
 
+        // SELECT-only "keep aspect" toggle for scale-handle drags.
+        preserveAspectRow = buildPreserveAspectRow()
+        container.addView(preserveAspectRow)
+
         // TEXT rows — per-box style for the box being edited / selected,
         // and the defaults for the next box. Hidden unless relevant.
         textFontRow    = buildTextFontRow()
@@ -1518,6 +1527,12 @@ class MainActivity : AppCompatActivity() {
         for (r in listOf(textFontRow, textSizeRow, textBoldRow, textItalicRow,
                          textUnderlineRow, textAlignRow, textSpacingRow)) {
             r.visibility = if (show) View.VISIBLE else View.GONE
+        }
+        // "keep aspect" shows for the SELECT tools, except while a text
+        // box is targeted — its resize is width-only, nothing to lock.
+        if (::preserveAspectRow.isInitialized) {
+            preserveAspectRow.visibility =
+                if (selectTool && !show) View.VISIBLE else View.GONE
         }
         if (!show && ::brushSectionHeader.isInitialized) {
             brushSectionHeader.text = toolHeaderTitle()
@@ -1732,6 +1747,47 @@ class MainActivity : AppCompatActivity() {
             valueLabel.text = if (strokeUniformAlpha) "on" else "off"
             valueLabel.setTextColor(getColor(
                 if (strokeUniformAlpha) R.color.hot else R.color.inkSoft))
+        }
+        return row
+    }
+
+    /** SELECT-only toggle: corner-handle scale drags keep the selection's
+     *  aspect ratio. Same layout as the uniform-α row. */
+    private fun buildPreserveAspectRow(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(10.dp, 4.dp, 10.dp, 4.dp)
+        }
+        val label = TextView(this).apply {
+            text = "keep aspect"
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            setTextColor(getColor(R.color.inkSoft))
+        }
+        val valueLabel = TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 11f
+            gravity = Gravity.END
+            text = if (preserveAspect) "on" else "off"
+            setTextColor(getColor(
+                if (preserveAspect) R.color.hot else R.color.inkSoft))
+        }
+        row.addView(label, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f))
+        row.addView(valueLabel, LinearLayout.LayoutParams(36.dp,
+            ViewGroup.LayoutParams.WRAP_CONTENT))
+        row.isClickable = true
+        row.isFocusable = true
+        row.setOnClickListener {
+            preserveAspect = !preserveAspect
+            NativeRenderer.setPreserveAspectEnabled(preserveAspect)
+            prefs().edit()
+                .putBoolean(kPrefPreserveAspect, preserveAspect)
+                .apply()
+            valueLabel.text = if (preserveAspect) "on" else "off"
+            valueLabel.setTextColor(getColor(
+                if (preserveAspect) R.color.hot else R.color.inkSoft))
         }
         return row
     }

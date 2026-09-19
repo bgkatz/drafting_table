@@ -126,6 +126,10 @@ Push points (search for `pushUndoEntry`):
 - `endInteraction` if shape changed during a transform drag (VectorMutate)
 - `applyPendingLayerActions` for `kActionClearActive` and add-layer paths
 
+### Keep-aspect scaling
+
+The SELECT panel's `keep aspect` row (pref `preserve_aspect`, native `g_preserveAspectEnabled`) makes corner-handle scale drags uniform for raster selections, Rects, and Ellipses via the shared `lockScaleAspect()` (largest-axis factor, anchor corner held). Imported images stay locked regardless (`g_rasterSel.fixedAspect`). Circles are already uniform, a Line drags one endpoint, text resize is width-only — so the row is hidden while a text box is targeted (`refreshTextPanel` owns its visibility). Both begin-interaction paths must fill `DragState::initialHalfW/H`, or the lock silently no-ops.
+
 ### Page bounds (canvas rectangle)
 
 The doc is mathematically infinite, but `setPageBounds(x0, y0, x1, y1)` defines a fixed-size canvas. When active:

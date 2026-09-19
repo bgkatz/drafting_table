@@ -1401,6 +1401,9 @@ std::atomic<int> g_snapEnabled{1};
 // of DrawingSurfaceView.angleSnapEnabled. When on, rotations and line
 // draws lock to 15° increments.
 std::atomic<int> g_angleSnapEnabled{0};
+// SELECT panel "keep aspect" toggle. When on, corner-handle scale drags
+// of a raster selection, Rect, or Ellipse scale both axes uniformly.
+std::atomic<int> g_preserveAspectEnabled{0};
 
 // Page bounds in doc-pixels — a fixed rectangle drawn during composite
 // to give the user a visual anchor when zoomed/rotated. Optional;
@@ -11835,6 +11838,32 @@ int hitTestRasterSelectionHandle(float x, float y) {
 // via separate JNIs so they never clash.
 DragState g_rasterDrag;
 
+// Aspect-locked scale drag: pick whichever axis the user has scaled
+// furthest from its initial extent and apply that factor to both axes.
+// The center is recomputed so the anchor (opposite corner) stays put,
+// otherwise the OBB would slide as the constraint adjusts the
+// dimensions. (ldx, ldy) is the anchor → handle vector in the OBB-local
+// frame. No-op when the drag has no usable initial extents.
+void lockScaleAspect(const DragState& d, float ldx, float ldy,
+                     float& newHw, float& newHh,
+                     float& newCx, float& newCy) {
+    if (d.initialHalfW <= 0.5f || d.initialHalfH <= 0.5f) return;
+    float fw = newHw / d.initialHalfW;
+    float fh = newHh / d.initialHalfH;
+    float f  = std::max(fw, fh);
+    if (f < 0.05f) f = 0.05f;
+    newHw = d.initialHalfW * f;
+    newHh = d.initialHalfH * f;
+    // anchor → center is (sign(ldx)*newHw, sign(ldy)*newHh) in local
+    // frame; rotate by the OBB's rotation and add to anchor.
+    float lcx = (ldx >= 0 ? 1.0f : -1.0f) * newHw;
+    float lcy = (ldy >= 0 ? 1.0f : -1.0f) * newHh;
+    float cw = std::cos(d.initialRotation);
+    float sw = std::sin(d.initialRotation);
+    newCx = d.anchorX + (lcx * cw - lcy * sw);
+    newCy = d.anchorY + (lcx * sw + lcy * cw);
+}
+
 // Snapshot the OBB's rotation and the drag-corner's anchor at the start
 // of a scale drag, so subsequent moves recompute against the initial
 // state instead of accumulating float drift.
@@ -11883,31 +11912,15 @@ void applyRasterScaleTo(float x, float y) {
     if (newHw < 0.5f) newHw = 0.5f;
     if (newHh < 0.5f) newHh = 0.5f;
 
-    // Fixed-aspect override: pick whichever axis the user has scaled
-    // furthest from its initial extent and apply that factor to both
-    // axes. The center is recomputed so the anchor (opposite corner)
-    // stays put, otherwise the OBB would slide as the constraint
-    // adjusts the dimensions.
-    bool aspectLocked = false;
-    {
+    // Aspect lock: always for selections flagged fixedAspect (imported
+    // images), otherwise when the "keep aspect" toggle is on.
+    bool aspectLocked = g_preserveAspectEnabled.load() != 0;
+    if (!aspectLocked) {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
         aspectLocked = g_rasterSel.active && g_rasterSel.fixedAspect;
     }
-    if (aspectLocked && d.initialHalfW > 0.5f && d.initialHalfH > 0.5f) {
-        float fw = newHw / d.initialHalfW;
-        float fh = newHh / d.initialHalfH;
-        float f  = std::max(fw, fh);
-        if (f < 0.05f) f = 0.05f;
-        newHw = d.initialHalfW * f;
-        newHh = d.initialHalfH * f;
-        // anchor → center is (sign(ldx)*newHw, sign(ldy)*newHh) in local
-        // frame; rotate by the OBB's rotation and add to anchor.
-        float lcx = (ldx >= 0 ? 1.0f : -1.0f) * newHw;
-        float lcy = (ldy >= 0 ? 1.0f : -1.0f) * newHh;
-        float cw = std::cos(d.initialRotation);
-        float sw = std::sin(d.initialRotation);
-        newCx = d.anchorX + (lcx * cw - lcy * sw);
-        newCy = d.anchorY + (lcx * sw + lcy * cw);
+    if (aspectLocked) {
+        lockScaleAspect(d, ldx, ldy, newHw, newHh, newCx, newCy);
     }
 
     std::lock_guard<std::mutex> lock(g_rasterSelMutex);
@@ -12071,6 +12084,9 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
         g_drag.grabOffsetX = x - gx;
         g_drag.grabOffsetY = y - gy;
         g_drag.initialRotation = obb.rotation;
+        // Initial half-extents, for the "keep aspect" uniform scale.
+        g_drag.initialHalfW = obb.hw;
+        g_drag.initialHalfH = obb.hh;
         g_transformBeforeSel = sel;
         snapshotSelectionShape(sel, g_transformBeforeShape);
         return 2;
@@ -12351,6 +12367,14 @@ void applyScaleTo(float x, float y) {
     float newHh = std::fabs(ldy) * 0.5f;
     if (newHw < 0.5f) newHw = 0.5f;
     if (newHh < 0.5f) newHh = 0.5f;
+
+    // "keep aspect" toggle. Only Rect / Ellipse have two free axes:
+    // a Circle is already uniform, a Line drags one endpoint, and a
+    // text box resize is width-only.
+    if (g_preserveAspectEnabled.load() != 0
+        && (sel.kind == ShapeKind::Rect || sel.kind == ShapeKind::Ellipse)) {
+        lockScaleAspect(d, ldx, ldy, newHw, newHh, newCx, newCy);
+    }
 
     switch (sel.kind) {
         case ShapeKind::Text:
@@ -12910,6 +12934,13 @@ JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setAngleSnapEnabled(
         JNIEnv*, jobject, jboolean enabled) {
     g_angleSnapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
+}
+
+// SELECT panel "keep aspect" toggle — see g_preserveAspectEnabled.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setPreserveAspectEnabled(
+        JNIEnv*, jobject, jboolean enabled) {
+    g_preserveAspectEnabled.store(enabled == JNI_TRUE ? 1 : 0);
 }
 
 // Runtime toggle for motion prediction. The Kotlin side reads this

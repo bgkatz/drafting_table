@@ -279,6 +279,13 @@ object NativeRenderer {
     external fun setAngleSnapEnabled(enabled: Boolean)
 
     /**
+     * SELECT panel "keep aspect" toggle. When on, corner-handle scale
+     * drags of a raster selection, Rect, or Ellipse scale both axes
+     * uniformly. Imported images stay aspect-locked regardless.
+     */
+    external fun setPreserveAspectEnabled(enabled: Boolean)
+
+    /**
      * Runtime toggle for motion-predicted dabs in the front-buffer
      * preview. When off, the Kotlin side stops dispatching predicted
      * batches; when on, predicted samples ride along in the
