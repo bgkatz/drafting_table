@@ -1158,6 +1158,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 // (selectMode would just be 0).
                 if (selectMode != 0) {
                     NativeRenderer.endInteraction()
+                    if (selectMode == 5) {
+                        // Mid-lasso on a vector layer: drop the path and
+                        // clear its front-buffer preview.
+                        lassoPathBuf.clear()
+                        renderer?.commit()
+                    }
                     selectMode = 0
                     selectChanged = false
                 }
@@ -1375,19 +1381,25 @@ class DrawingSurfaceView @JvmOverloads constructor(
             Tool.BRUSH, Tool.ERASER, Tool.SHADE -> handleStrokeEvent(r, event)
             Tool.BUCKET             -> handleBucketEvent(event)
             Tool.TEXT               -> handleTextEvent(r, event)
-            Tool.SELECT             -> handleSelectEvent(event)
-            // The marquee/rectangle selection tool dispatches by active
-            // layer type: raster → lift pixels into a floating raster
-            // selection; vector → tap-to-select / marquee multi-select
-            // shapes. One icon, two behaviors — eliminates the prior
-            // "vector select" rail entry.
+            Tool.SELECT             -> handleSelectEvent(r, event)
+            // The marquee/rectangle and lasso selection tools dispatch
+            // by active layer type: raster → lift pixels into a
+            // floating raster selection; vector → tap-to-select plus
+            // marquee (rect) or freeform-polygon (lasso) multi-select
+            // of shapes. One icon, two behaviors — eliminates the
+            // prior "vector select" rail entry.
             Tool.SELECT_RECT        -> {
                 val activeIsVector = NativeRenderer.getLayerType(
                     NativeRenderer.getActiveLayer()) == 1
-                if (activeIsVector) handleSelectEvent(event)
+                if (activeIsVector) handleSelectEvent(r, event)
                 else                handleSelectRectEvent(r, event)
             }
-            Tool.SELECT_LASSO       -> handleSelectLassoEvent(r, event)
+            Tool.SELECT_LASSO       -> {
+                val activeIsVector = NativeRenderer.getLayerType(
+                    NativeRenderer.getActiveLayer()) == 1
+                if (activeIsVector) handleSelectEvent(r, event, lasso = true)
+                else                handleSelectLassoEvent(r, event)
+            }
             else                    -> handleShapeEvent(r, event, currentTool.shapeType)
         }
     }
@@ -1728,13 +1740,29 @@ class DrawingSurfaceView @JvmOverloads constructor(
     // first tap selects, second tap edits, like a slide deck.
     private var selectDownTextId = 0
 
-    private fun handleSelectEvent(event: MotionEvent): Boolean {
+    /** Vector-layer SELECT handling. With `lasso` set (SELECT_LASSO on
+     *  a vector layer) an empty-canvas press collects a freeform path
+     *  (mode 5) instead of dragging a rectangle marquee; handle, body
+     *  and shape taps behave identically either way. */
+    private fun handleSelectEvent(
+        r: GLFrontBufferedRenderer<StrokeAction>,
+        event: MotionEvent,
+        lasso: Boolean = false
+    ): Boolean {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 selectDownTextId = NativeRenderer.getSelectedTextBoxId()
                 viewToDoc(event.x, event.y, tmpDoc)
-                selectMode = NativeRenderer.beginInteractionAt(tmpDoc[0], tmpDoc[1])
+                selectMode = if (lasso) {
+                    NativeRenderer.beginLassoInteractionAt(tmpDoc[0], tmpDoc[1])
+                } else {
+                    NativeRenderer.beginInteractionAt(tmpDoc[0], tmpDoc[1])
+                }
                 selectChanged = false
+                if (selectMode == 5) {
+                    lassoPathBuf.clear()
+                    lassoPathBuf.add(tmpDoc[0]); lassoPathBuf.add(tmpDoc[1])
+                }
                 forceRedraw()
                 onSelectionChanged?.invoke()
             }
@@ -1755,12 +1783,40 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         NativeRenderer.updateInteractionAt(tmpDoc[0], tmpDoc[1])
                         forceRedraw()
                     }
+                    5 -> { // lasso define — extend the path, preview it
+                        val n = lassoPathBuf.size
+                        val ddx = tmpDoc[0] - lassoPathBuf[n - 2]
+                        val ddy = tmpDoc[1] - lassoPathBuf[n - 1]
+                        val minSp = lassoMinSpacingDoc
+                        if (ddx * ddx + ddy * ddy >= minSp * minSp) {
+                            lassoPathBuf.add(tmpDoc[0]); lassoPathBuf.add(tmpDoc[1])
+                        }
+                        r.renderFrontBufferedLayer(
+                            StrokeAction.LassoPreview(
+                                points = lassoPathBuf.toFloatArray(),
+                                closed = false
+                            )
+                        )
+                    }
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 NativeRenderer.endInteraction()
                 if (selectChanged) {
                     NativeRenderer.persistActiveVectorLayer()
+                }
+                if (selectMode == 5) {
+                    // Need at least 3 points for a polygon; a plain tap
+                    // already deselected in the begin path.
+                    if (event.actionMasked == MotionEvent.ACTION_UP
+                        && lassoPathBuf.size >= 6) {
+                        NativeRenderer.selectVectorShapesInPolygon(
+                            lassoPathBuf.toFloatArray())
+                    }
+                    lassoPathBuf.clear()
+                    // commit() clears the front-buffered path preview and
+                    // drives the multi-buffer pass that paints the halos.
+                    r.commit()
                 }
                 // Marquee finalization needs a redraw to clear the
                 // rect overlay + paint the new selection halos.

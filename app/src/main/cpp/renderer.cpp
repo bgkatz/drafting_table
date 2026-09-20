@@ -7954,6 +7954,208 @@ bool shapeOutlineIntersectsMarquee(const ShapeData& s,
     }
 }
 
+// ---- Lasso (freeform polygon) outline-intersection helpers ---------------
+//
+// The SELECT_LASSO tool on a vector layer. Same "touch outline only"
+// semantics as the marquee, against the closed lasso polygon instead of
+// an AABB: a shape joins the selection when one of its fat outline
+// segments has an endpoint inside the polygon or passes within its
+// half-width of a polygon edge. A lasso drawn wholly inside a big
+// rectangle therefore does NOT select it, matching the marquee.
+
+// Shortest distance between two segments: zero when they properly
+// cross, else the smallest of the four endpoint-to-segment distances
+// (which also covers touching / collinear cases).
+float segmentToSegmentDist(float ax, float ay, float bx, float by,
+                           float cx, float cy, float dx, float dy) {
+    auto orient = [](float px, float py, float qx, float qy,
+                     float rx, float ry) {
+        return (qx - px) * (ry - py) - (qy - py) * (rx - px);
+    };
+    float o1 = orient(ax, ay, bx, by, cx, cy);
+    float o2 = orient(ax, ay, bx, by, dx, dy);
+    float o3 = orient(cx, cy, dx, dy, ax, ay);
+    float o4 = orient(cx, cy, dx, dy, bx, by);
+    if (((o1 > 0.0f) != (o2 > 0.0f)) && ((o3 > 0.0f) != (o4 > 0.0f))) {
+        return 0.0f;
+    }
+    float d = distToSegment(ax, ay, cx, cy, dx, dy);
+    d = std::min(d, distToSegment(bx, by, cx, cy, dx, dy));
+    d = std::min(d, distToSegment(cx, cy, ax, ay, bx, by));
+    d = std::min(d, distToSegment(dx, dy, ax, ay, bx, by));
+    return d;
+}
+
+// Fat segment vs the region of closed polygon xy[0..n).
+bool fatSegmentIntersectsPolygon(float ax, float ay, float bx, float by,
+                                 float halfWidth,
+                                 const float* xy, size_t n) {
+    if (pointInPolygonNonzero(xy, n, ax, ay)) return true;
+    if (pointInPolygonNonzero(xy, n, bx, by)) return true;
+    for (size_t i = 0; i < n; ++i) {
+        size_t j = (i + 1) % n;
+        if (segmentToSegmentDist(ax, ay, bx, by,
+                                 xy[2 * i], xy[2 * i + 1],
+                                 xy[2 * j], xy[2 * j + 1]) <= halfWidth) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Rotated-rect outline (4 fat edges) vs polygon.
+bool rectOutlineIntersectsPolygon(const Rect& r, const float* xy, size_t n) {
+    float cx = (r.x0 + r.x1) * 0.5f, cy = (r.y0 + r.y1) * 0.5f;
+    float hw = std::fabs(r.x1 - r.x0) * 0.5f;
+    float hh = std::fabs(r.y1 - r.y0) * 0.5f;
+    float c = std::cos(r.rotation), si = std::sin(r.rotation);
+    auto corner = [&](float sx, float sy, float& ox, float& oy) {
+        float lx = sx * hw, ly = sy * hh;
+        ox = cx + lx * c - ly * si;
+        oy = cy + lx * si + ly * c;
+    };
+    float qx[4], qy[4];
+    corner(-1.0f, -1.0f, qx[0], qy[0]);
+    corner( 1.0f, -1.0f, qx[1], qy[1]);
+    corner( 1.0f,  1.0f, qx[2], qy[2]);
+    corner(-1.0f,  1.0f, qx[3], qy[3]);
+    float halfW = r.width * 0.5f;
+    for (int i = 0; i < 4; ++i) {
+        int j = (i + 1) & 3;
+        if (fatSegmentIntersectsPolygon(qx[i], qy[i], qx[j], qy[j],
+                                        halfW, xy, n)) return true;
+    }
+    return false;
+}
+
+// Ellipse (or circle: rx == ry) outline sampled as 64 segments vs
+// polygon. Runs once per shape at the end of a drag, so the
+// 64 x polygon-length segment pairs are cheap.
+bool ellipseOutlineIntersectsPolygon(float cx, float cy, float rx, float ry,
+                                     float rotation, float halfWidth,
+                                     const float* xy, size_t n) {
+    constexpr int N = 64;
+    float c = std::cos(rotation), si = std::sin(rotation);
+    float prevX = cx + rx * c;
+    float prevY = cy + rx * si;
+    for (int i = 1; i <= N; ++i) {
+        float ang = (float)i * (2.0f * 3.14159265358979323846f / N);
+        float lx = rx * std::cos(ang), ly = ry * std::sin(ang);
+        float px = cx + lx * c - ly * si;
+        float py = cy + lx * si + ly * c;
+        if (fatSegmentIntersectsPolygon(prevX, prevY, px, py, halfWidth,
+                                        xy, n)) return true;
+        prevX = px; prevY = py;
+    }
+    return false;
+}
+
+DocBbox polygonAabb(const float* xy, size_t n) {
+    DocBbox bb{ xy[0], xy[1], xy[0], xy[1] };
+    for (size_t i = 1; i < n; ++i) {
+        bb.minX = std::min(bb.minX, xy[2 * i]);
+        bb.maxX = std::max(bb.maxX, xy[2 * i]);
+        bb.minY = std::min(bb.minY, xy[2 * i + 1]);
+        bb.maxY = std::max(bb.maxY, xy[2 * i + 1]);
+    }
+    return bb;
+}
+
+// Per-shape outline intersection test for the lasso. polyBb is the
+// polygon's AABB, for the same fast pre-reject the marquee uses.
+bool shapeOutlineIntersectsPolygon(const ShapeData& s,
+                                   const float* xy, size_t n,
+                                   const DocBbox& polyBb) {
+    DocBbox bb = shapeAabb(s);
+    if (bb.maxX < polyBb.minX || bb.minX > polyBb.maxX
+     || bb.maxY < polyBb.minY || bb.minY > polyBb.maxY) return false;
+    switch (s.kind) {
+        case ShapeKind::Line: {
+            const Line& l = s.line;
+            return fatSegmentIntersectsPolygon(l.x0, l.y0, l.x1, l.y1,
+                                               l.width * 0.5f, xy, n);
+        }
+        case ShapeKind::Rect:
+            return rectOutlineIntersectsPolygon(s.rect, xy, n);
+        case ShapeKind::Ellipse: {
+            const Ellipse& e = s.ellipse;
+            return ellipseOutlineIntersectsPolygon(e.cx, e.cy, e.rx, e.ry,
+                                                   e.rotation, e.width * 0.5f,
+                                                   xy, n);
+        }
+        case ShapeKind::Circle: {
+            const Circle& c = s.circle;
+            return ellipseOutlineIntersectsPolygon(c.cx, c.cy, c.radius,
+                                                   c.radius, 0.0f,
+                                                   c.width * 0.5f, xy, n);
+        }
+        case ShapeKind::Text: {
+            // Box edge as a zero-width rect outline, plus containment
+            // of any lasso vertex so a lasso drawn inside a big box
+            // still picks it up (mirrors the marquee's centre test).
+            const TextBox& t = s.text;
+            Rect r{ t.x, t.y, t.x + t.w, t.y + t.h, t.rotation, 0u, 0.0f };
+            if (rectOutlineIntersectsPolygon(r, xy, n)) return true;
+            for (size_t i = 0; i < n; ++i) {
+                if (textBoxContains(t, xy[2 * i], xy[2 * i + 1], 0.0f)) return true;
+            }
+            return false;
+        }
+        default:
+            return false;
+    }
+}
+
+// Replace the vector selection with every shape on the active vector
+// layer that the predicate accepts: first hit becomes the primary, the
+// rest the extras. Shared by the marquee finalize and the lasso select.
+// Returns false (selection untouched) when the active layer is not a
+// vector layer.
+template <typename Pred>
+bool selectActiveLayerShapesWhere(Pred pred) {
+    if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return false;
+    Layer& layer = *layers()[activeLayer()];
+    if (layer.type != LayerType::Vector) return false;
+
+    std::vector<Selection> hits;
+    auto add = [&](ShapeKind kind, size_t idx) {
+        Selection s;
+        s.kind     = kind;
+        s.layerIdx = activeLayer();
+        s.shapeIdx = idx;
+        hits.push_back(s);
+    };
+    for (size_t i = 0; i < layer.lines.size(); ++i) {
+        ShapeData sd; sd.kind = ShapeKind::Line; sd.line = layer.lines[i];
+        if (pred(sd)) add(ShapeKind::Line, i);
+    }
+    for (size_t i = 0; i < layer.rects.size(); ++i) {
+        ShapeData sd; sd.kind = ShapeKind::Rect; sd.rect = layer.rects[i];
+        if (pred(sd)) add(ShapeKind::Rect, i);
+    }
+    for (size_t i = 0; i < layer.ellipses.size(); ++i) {
+        ShapeData sd; sd.kind = ShapeKind::Ellipse; sd.ellipse = layer.ellipses[i];
+        if (pred(sd)) add(ShapeKind::Ellipse, i);
+    }
+    for (size_t i = 0; i < layer.circles.size(); ++i) {
+        ShapeData sd; sd.kind = ShapeKind::Circle; sd.circle = layer.circles[i];
+        if (pred(sd)) add(ShapeKind::Circle, i);
+    }
+    for (size_t i = 0; i < layer.texts.size(); ++i) {
+        ShapeData sd; sd.kind = ShapeKind::Text; sd.text = layer.texts[i];
+        if (pred(sd)) add(ShapeKind::Text, i);
+    }
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    if (hits.empty()) {
+        g_selection = Selection{};
+        g_extraSelections.clear();
+    } else {
+        g_selection = hits.front();
+        g_extraSelections.assign(hits.begin() + 1, hits.end());
+    }
+    return true;
+}
+
 // Hit-test the active layer at (x, y); on hit, set g_selection. Returns
 // true if a shape was selected, false if no shape was hit (and clears
 // any prior selection). Searches in render order so the topmost shape
@@ -9496,6 +9698,9 @@ bool liftRasterSelectionPolygon(const float* points, size_t nPoints) {
     {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
         g_rasterSel.active = true;
+        // Lifted pixels scale freely; only imports lock the aspect
+        // (import sets this true after activating).
+        g_rasterSel.fixedAspect = false;
         g_rasterSel.layerIdx = activeLayer();
         g_rasterSel.bboxMinX = static_cast<float>(rectIX0);
         g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
@@ -9669,6 +9874,9 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
     {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
         g_rasterSel.active = true;
+        // Lifted pixels scale freely; only imports lock the aspect
+        // (import sets this true after activating).
+        g_rasterSel.fixedAspect = false;
         g_rasterSel.layerIdx = activeLayer();
         g_rasterSel.bboxMinX = static_cast<float>(rectIX0);
         g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
@@ -10170,6 +10378,7 @@ bool pasteRasterSelectionImpl() {
     // Paste has no source tiles to restore on cancel — cancel just
     // drops the floating selection.
     g_rasterSel.liftedTiles.clear();
+    g_rasterSel.fixedAspect = false;
     g_rasterSel.layerIdx = activeLayer();
     g_rasterSel.active   = true;
     return true;
@@ -12007,10 +12216,11 @@ void applyRasterMoveTo(float x, float y) {
 
 // Begin an interaction at (x, y). Tries handles first, then shape body
 // (re-hit-test if no current selection or tap is outside selected OBB).
-// Returns drag mode: 0=none, 1=move, 2=scale, 3=rotate.
-JNIEXPORT jint JNICALL
-Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
-        JNIEnv*, jobject, jfloat x, jfloat y) {
+// Returns drag mode: 0=none, 1=move, 2=scale, 3=rotate, 4=marquee.
+// With marqueeOnMiss false (the lasso tool) an empty-canvas tap returns
+// 5 instead of starting a marquee: Kotlin then collects the freeform
+// path and finishes through selectVectorShapesInPolygon.
+static int beginInteractionImpl(float x, float y, bool marqueeOnMiss) {
     // Reset stale snap state from a prior drag so the hysteresis in
     // findSnap doesn't bias the first frame of this new interaction.
     {
@@ -12159,11 +12369,53 @@ Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
     // point (no drag) just lands as "deselect" — endInteraction sees
     // the marquee rect with zero area and produces no selection.
     std::lock_guard<std::mutex> lock(g_selectionMutex);
+    if (!marqueeOnMiss) {
+        g_drag.mode = DragMode::None;
+        return 5;
+    }
     g_drag.mode = DragMode::Marquee;
     g_marqueeActive = true;
     g_marqueeX0 = x; g_marqueeY0 = y;
     g_marqueeX1 = x; g_marqueeY1 = y;
     return 4;
+}
+
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_beginInteractionAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    return beginInteractionImpl(x, y, /*marqueeOnMiss=*/true);
+}
+
+// SELECT_LASSO on a vector layer: same handle / body / shape hit-test
+// as beginInteractionAt, but a miss returns 5 (lasso define) instead of
+// starting a rectangle marquee.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_beginLassoInteractionAt(
+        JNIEnv*, jobject, jfloat x, jfloat y) {
+    return beginInteractionImpl(x, y, /*marqueeOnMiss=*/false);
+}
+
+// Finish a vector lasso: select every shape on the active vector layer
+// whose outline touches the closed polygon (flat doc-px
+// [x0,y0,x1,y1,...]; the closing edge is implicit). Mutates g_selection
+// from the UI thread under g_selectionMutex, exactly as
+// hitTestActiveVectorLayer does. Returns true if anything was selected.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_selectVectorShapesInPolygon(
+        JNIEnv* env, jobject, jfloatArray jpoints) {
+    if (!jpoints) return JNI_FALSE;
+    jsize len = env->GetArrayLength(jpoints);
+    if (len < 6 || (len & 1) != 0) return JNI_FALSE;
+    std::vector<float> pts(static_cast<size_t>(len));
+    env->GetFloatArrayRegion(jpoints, 0, len, pts.data());
+    size_t n = static_cast<size_t>(len) / 2;
+    DocBbox pb = polygonAabb(pts.data(), n);
+    selectActiveLayerShapesWhere([&](const ShapeData& sd) {
+        return shapeOutlineIntersectsPolygon(sd, pts.data(), n, pb);
+    });
+    g_mbCacheValid = false;
+    std::lock_guard<std::mutex> lock(g_selectionMutex);
+    return g_selection.kind != ShapeKind::None ? JNI_TRUE : JNI_FALSE;
 }
 
 // Translate the given selection's shape by (dx, dy). Caller must hold
@@ -12584,51 +12836,9 @@ Java_com_bk_drawing_NativeRenderer_endInteraction(JNIEnv*, jobject) {
         // — hitTestActiveVectorLayer in the begin path already cleared
         // the prior selection.
         if (mx1 - mx0 < 1.0f && my1 - my0 < 1.0f) return;
-        if (activeLayer() >= layers().size() || !layers()[activeLayer()]) return;
-        Layer& layer = *layers()[activeLayer()];
-        if (layer.type != LayerType::Vector) return;
-
-        std::vector<Selection> hits;
-        auto add = [&](ShapeKind kind, size_t idx) {
-            Selection s;
-            s.kind     = kind;
-            s.layerIdx = activeLayer();
-            s.shapeIdx = idx;
-            hits.push_back(s);
-        };
-        for (size_t i = 0; i < layer.lines.size(); ++i) {
-            ShapeData sd; sd.kind = ShapeKind::Line; sd.line = layer.lines[i];
-            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
-                add(ShapeKind::Line, i);
-        }
-        for (size_t i = 0; i < layer.rects.size(); ++i) {
-            ShapeData sd; sd.kind = ShapeKind::Rect; sd.rect = layer.rects[i];
-            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
-                add(ShapeKind::Rect, i);
-        }
-        for (size_t i = 0; i < layer.ellipses.size(); ++i) {
-            ShapeData sd; sd.kind = ShapeKind::Ellipse; sd.ellipse = layer.ellipses[i];
-            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
-                add(ShapeKind::Ellipse, i);
-        }
-        for (size_t i = 0; i < layer.circles.size(); ++i) {
-            ShapeData sd; sd.kind = ShapeKind::Circle; sd.circle = layer.circles[i];
-            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
-                add(ShapeKind::Circle, i);
-        }
-        for (size_t i = 0; i < layer.texts.size(); ++i) {
-            ShapeData sd; sd.kind = ShapeKind::Text; sd.text = layer.texts[i];
-            if (shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1))
-                add(ShapeKind::Text, i);
-        }
-        std::lock_guard<std::mutex> lock(g_selectionMutex);
-        if (hits.empty()) {
-            g_selection = Selection{};
-            g_extraSelections.clear();
-        } else {
-            g_selection = hits.front();
-            g_extraSelections.assign(hits.begin() + 1, hits.end());
-        }
+        selectActiveLayerShapesWhere([&](const ShapeData& sd) {
+            return shapeOutlineIntersectsMarquee(sd, mx0, my0, mx1, my1);
+        });
         return;
     }
     if (wasMode == DragMode::None || beforeSel.kind == ShapeKind::None) return;

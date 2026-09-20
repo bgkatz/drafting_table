@@ -356,6 +356,18 @@ object NativeRenderer {
      */
     external fun beginInteractionAt(x: Float, y: Float): Int
 
+    /** SELECT_LASSO on a vector layer: same hit-test as
+     *  beginInteractionAt, but a miss returns 5 (lasso define) instead
+     *  of 4 (rectangle marquee). Collect the pen path and finish with
+     *  selectVectorShapesInPolygon. */
+    external fun beginLassoInteractionAt(x: Float, y: Float): Int
+
+    /** Finish a vector lasso: select every shape on the active vector
+     *  layer whose outline touches the closed polygon (flat doc-px
+     *  [x0,y0,x1,y1,...], closing edge implicit). Returns true if
+     *  anything was selected. */
+    external fun selectVectorShapesInPolygon(points: FloatArray): Boolean
+
     /** Drive an in-progress scale, rotate, or move interaction to (x, y).
      *  No-op if no interaction is active. (For Move, prefer the dedicated
      *  moveSelectionTo entry point — both go through the same path.) */
