@@ -3705,14 +3705,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val kExportMaxDim = 4096
+    // Export bitmap budget. The GPU no longer bounds this — native
+    // renders the page in 4096 px chunks (renderPageThumbnail) — so it
+    // is about memory and encode time: 4 bytes per pixel for the
+    // bitmap plus the encoder's working copy. 64 Mpx (256 MB) takes a
+    // 4300×5980 page at ~1.5x; anything bigger shrinks uniformly. The
+    // per-side cap is a sanity bound for the bitmap / PDF encoders.
+    private val kExportMaxPixels = 64L * 1024 * 1024
+    private val kExportMaxDim = 16384
 
-    /** Bitmap dims for a page at [scale], shrunk uniformly if either
-     *  side would exceed the GPU cap — no letterbox bars. */
+    /** Bitmap dims for a page at [scale], shrunk uniformly if they would
+     *  bust the pixel budget or the per-side cap — no letterbox bars. */
     private fun exportDims(scale: Float): Pair<Int, Int> {
         val pw = NativeRenderer.getPageWidth().coerceAtLeast(1).toFloat()
         val ph = NativeRenderer.getPageHeight().coerceAtLeast(1).toFloat()
-        val f = minOf(scale, kExportMaxDim / pw, kExportMaxDim / ph)
+        var f = minOf(scale, kExportMaxDim / pw, kExportMaxDim / ph)
+        val px = pw.toDouble() * f * ph.toDouble() * f
+        if (px > kExportMaxPixels) {
+            f *= Math.sqrt(kExportMaxPixels / px).toFloat()
+        }
         return Pair(Math.round(pw * f).coerceAtLeast(1), Math.round(ph * f).coerceAtLeast(1))
     }
 

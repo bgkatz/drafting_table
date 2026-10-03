@@ -2072,6 +2072,12 @@ struct DragState {
     // selections with fixedAspect set; lets applyRasterScaleTo derive
     // a uniform scale factor preserving the original aspect ratio.
     float    initialHalfW = 0.0f, initialHalfH = 0.0f;
+    // Scale (raster): which side of the anchor the grabbed handle sat
+    // on at drag start, in the OBB-local frame (±1 per axis), and the
+    // selection's flip state then. A drag that carries the handle to
+    // the other side of the anchor toggles that axis's flip.
+    float    initialSignX = 1.0f, initialSignY = 1.0f;
+    bool     initialFlipX = false, initialFlipY = false;
     // Scale: offset from the pen to the grabbed handle, captured at drag
     // start. The dragged corner tracks (pen − offset) so it moves by
     // exactly the pen delta. Without this the corner teleports to the
@@ -2317,9 +2323,32 @@ struct RasterSelection {
     // ratio (uniform scaling). Set on imported images so the user can't
     // accidentally squash the picture.
     bool   fixedAspect = false;
+    // Mirror state: set when a scale-handle drag carries the handle
+    // through the opposite edge (Photoshop-style flip about that axis).
+    // Pure placement — the content texture is never rewritten; the
+    // draw and the commit bake just swap which placement corner gets
+    // which texture edge.
+    bool   flipX = false, flipY = false;
 };
 std::mutex      g_rasterSelMutex;
 RasterSelection g_rasterSel;
+
+// Placement corners of a floating raster selection, in the order the
+// selection shader expects (C0 = texture top-left, C1 = top-right,
+// C2 = bottom-right, C3 = bottom-left). A flip swaps the corners along
+// that axis so the texture reads mirrored.
+inline void rasterSelLocalCorner(int i, float hw, float hh,
+                                 bool flipX, bool flipY,
+                                 float& lx, float& ly) {
+    float sx = flipX ? 1.0f : -1.0f;
+    float sy = flipY ? 1.0f : -1.0f;
+    switch (i) {
+        case 0:  lx =  sx * hw; ly =  sy * hh; break;
+        case 1:  lx = -sx * hw; ly =  sy * hh; break;
+        case 2:  lx = -sx * hw; ly = -sy * hh; break;
+        default: lx =  sx * hw; ly = -sy * hh; break;
+    }
+}
 
 // Cross-document raster clipboard. Holds the content bytes (RGBA8,
 // premultiplied, contentW × contentH) plus the placement OBB at the
@@ -2332,6 +2361,7 @@ struct RasterClipboard {
     float  centerX  = 0.0f, centerY = 0.0f;
     float  halfW    = 0.0f, halfH   = 0.0f;
     float  rotation = 0.0f;
+    bool   flipX    = false, flipY = false;
     std::vector<uint8_t> bytes;
 };
 std::mutex       g_rasterClipboardMutex;
@@ -2986,6 +3016,8 @@ void applyPendingLayerActions() {
                 // simply drops it (and the empty layer remains).
                 g_rasterSel.liftedTiles.clear();
                 g_rasterSel.fixedAspect = true;
+                g_rasterSel.flipX = false;
+                g_rasterSel.flipY = false;
             }
             LOGI("import image: %dx%d → layer %zu (scale=%.3f)",
                  pending.width, pending.height, activeLayer(),
@@ -8652,6 +8684,7 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
         size_t selLayerIdx = 0;
         Obb    selObb{};
         GLuint contentTex = 0;
+        bool   selFlipX = false, selFlipY = false;
         {
             std::lock_guard<std::mutex> lock(g_rasterSelMutex);
             if (g_rasterSel.active) {
@@ -8659,6 +8692,8 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
                 selLayerIdx = g_rasterSel.layerIdx;
                 selObb      = obbForRasterSelection(g_rasterSel);
                 contentTex  = g_rasterSel.contentTex;
+                selFlipX    = g_rasterSel.flipX;
+                selFlipY    = g_rasterSel.flipY;
             }
         }
         if (selActive && contentTex != 0) {
@@ -8672,12 +8707,18 @@ void compositeAllLayers(JNIEnv* env, jint width, jint height,
                 layerOpacity = layers()[selLayerIdx]->opacity
                     .load(std::memory_order_relaxed);
             }
-            // Compute the four placement corners in doc-coords.
+            // Compute the four placement corners in doc-coords (flip
+            // state decides which corner carries which texture edge).
             float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
-            rotateLocalToWorld(selObb, -selObb.hw, -selObb.hh, c0x, c0y);
-            rotateLocalToWorld(selObb, +selObb.hw, -selObb.hh, c1x, c1y);
-            rotateLocalToWorld(selObb, +selObb.hw, +selObb.hh, c2x, c2y);
-            rotateLocalToWorld(selObb, -selObb.hw, +selObb.hh, c3x, c3y);
+            float lx, ly;
+            rasterSelLocalCorner(0, selObb.hw, selObb.hh, selFlipX, selFlipY, lx, ly);
+            rotateLocalToWorld(selObb, lx, ly, c0x, c0y);
+            rasterSelLocalCorner(1, selObb.hw, selObb.hh, selFlipX, selFlipY, lx, ly);
+            rotateLocalToWorld(selObb, lx, ly, c1x, c1y);
+            rasterSelLocalCorner(2, selObb.hw, selObb.hh, selFlipX, selFlipY, lx, ly);
+            rotateLocalToWorld(selObb, lx, ly, c2x, c2y);
+            rasterSelLocalCorner(3, selObb.hw, selObb.hh, selFlipX, selFlipY, lx, ly);
+            rotateLocalToWorld(selObb, lx, ly, c3x, c3y);
             glUseProgram(g_sel.program);
             glBindVertexArray(g_quadVao);
             uploadMat4(env, g_sel.uTransform, transform);
@@ -9767,6 +9808,8 @@ bool liftRasterSelectionPolygon(const float* points, size_t nPoints) {
         // Lifted pixels scale freely; only imports lock the aspect
         // (import sets this true after activating).
         g_rasterSel.fixedAspect = false;
+        g_rasterSel.flipX = false;
+        g_rasterSel.flipY = false;
         g_rasterSel.layerIdx = activeLayer();
         g_rasterSel.bboxMinX = static_cast<float>(rectIX0);
         g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
@@ -9943,6 +9986,8 @@ bool liftRasterSelectionRect(float x0, float y0, float x1, float y1) {
         // Lifted pixels scale freely; only imports lock the aspect
         // (import sets this true after activating).
         g_rasterSel.fixedAspect = false;
+        g_rasterSel.flipX = false;
+        g_rasterSel.flipY = false;
         g_rasterSel.layerIdx = activeLayer();
         g_rasterSel.bboxMinX = static_cast<float>(rectIX0);
         g_rasterSel.bboxMinY = static_cast<float>(rectIY0);
@@ -9994,10 +10039,17 @@ void commitRasterSelectionImpl() {
     // selection's OBB. Layout matches kSelVS (uC0=top-left UV, etc.).
     Obb selObb = obbForRasterSelection(sel);
     float c0x, c0y, c1x, c1y, c2x, c2y, c3x, c3y;
-    rotateLocalToWorld(selObb, -selObb.hw, -selObb.hh, c0x, c0y);
-    rotateLocalToWorld(selObb, +selObb.hw, -selObb.hh, c1x, c1y);
-    rotateLocalToWorld(selObb, +selObb.hw, +selObb.hh, c2x, c2y);
-    rotateLocalToWorld(selObb, -selObb.hw, +selObb.hh, c3x, c3y);
+    {
+        float lx, ly;
+        rasterSelLocalCorner(0, selObb.hw, selObb.hh, sel.flipX, sel.flipY, lx, ly);
+        rotateLocalToWorld(selObb, lx, ly, c0x, c0y);
+        rasterSelLocalCorner(1, selObb.hw, selObb.hh, sel.flipX, sel.flipY, lx, ly);
+        rotateLocalToWorld(selObb, lx, ly, c1x, c1y);
+        rasterSelLocalCorner(2, selObb.hw, selObb.hh, sel.flipX, sel.flipY, lx, ly);
+        rotateLocalToWorld(selObb, lx, ly, c2x, c2y);
+        rasterSelLocalCorner(3, selObb.hw, selObb.hh, sel.flipX, sel.flipY, lx, ly);
+        rotateLocalToWorld(selObb, lx, ly, c3x, c3y);
+    }
 
     // Snap an unrotated placement to the doc-pixel grid before baking.
     //
@@ -10032,10 +10084,13 @@ void commitRasterSelectionImpl() {
             if (maxX <= minX) maxX = minX + 1.0f;
             if (maxY <= minY) maxY = minY + 1.0f;
         }
-        c0x = minX; c0y = minY;
-        c1x = maxX; c1y = minY;
-        c2x = maxX; c2y = maxY;
-        c3x = minX; c3y = maxY;
+        // Same corner order as the general path, honouring the flips.
+        float lxMin = sel.flipX ? maxX : minX, lxMax = sel.flipX ? minX : maxX;
+        float lyMin = sel.flipY ? maxY : minY, lyMax = sel.flipY ? minY : maxY;
+        c0x = lxMin; c0y = lyMin;
+        c1x = lxMax; c1y = lyMin;
+        c2x = lxMax; c2y = lyMax;
+        c3x = lxMin; c3y = lyMax;
     }
 
     // Axis-aligned bounding box of the (possibly rotated) placement.
@@ -10341,6 +10396,7 @@ void copyRasterSelectionImpl() {
     GLuint contentTex = 0;
     int    w = 0, h = 0;
     float  cx = 0, cy = 0, hw = 0, hh = 0, rot = 0;
+    bool   flipX = false, flipY = false;
     {
         std::lock_guard<std::mutex> lock(g_rasterSelMutex);
         if (!g_rasterSel.active) return;
@@ -10352,6 +10408,8 @@ void copyRasterSelectionImpl() {
         hw = g_rasterSel.halfW;
         hh = g_rasterSel.halfH;
         rot = g_rasterSel.rotation;
+        flipX = g_rasterSel.flipX;
+        flipY = g_rasterSel.flipY;
     }
     if (contentTex == 0 || w <= 0 || h <= 0) return;
 
@@ -10377,6 +10435,8 @@ void copyRasterSelectionImpl() {
         g_rasterClipboard.halfW    = hw;
         g_rasterClipboard.halfH    = hh;
         g_rasterClipboard.rotation = rot;
+        g_rasterClipboard.flipX    = flipX;
+        g_rasterClipboard.flipY    = flipY;
         g_rasterClipboard.present  = true;
     }
     g_clipboardKind.store(1, std::memory_order_release);   // 1 = Raster
@@ -10445,6 +10505,8 @@ bool pasteRasterSelectionImpl() {
     // drops the floating selection.
     g_rasterSel.liftedTiles.clear();
     g_rasterSel.fixedAspect = false;
+    g_rasterSel.flipX = cb.flipX;
+    g_rasterSel.flipY = cb.flipY;
     g_rasterSel.layerIdx = activeLayer();
     g_rasterSel.active   = true;
     return true;
@@ -12187,6 +12249,14 @@ void applyRasterScaleTo(float x, float y) {
     if (newHw < 0.5f) newHw = 0.5f;
     if (newHh < 0.5f) newHh = 0.5f;
 
+    // Mirror: the handle has been dragged through the anchor along an
+    // axis when its local offset changed sign since drag start. That
+    // toggles the flip on that axis relative to the drag's initial
+    // flip state (so re-crossing flips back, and a selection that was
+    // already mirrored keeps its state as the baseline).
+    bool flipX = d.initialFlipX != ((ldx * d.initialSignX) < 0.0f);
+    bool flipY = d.initialFlipY != ((ldy * d.initialSignY) < 0.0f);
+
     // Aspect lock: always for selections flagged fixedAspect (imported
     // images), otherwise when the "keep aspect" toggle is on.
     bool aspectLocked = g_preserveAspectEnabled.load() != 0;
@@ -12205,6 +12275,8 @@ void applyRasterScaleTo(float x, float y) {
     g_rasterSel.halfW    = newHw;
     g_rasterSel.halfH    = newHh;
     g_rasterSel.rotation = d.initialRotation;
+    g_rasterSel.flipX    = flipX;
+    g_rasterSel.flipY    = flipY;
     g_rasterDrag.snapActive = snap.found;
     g_rasterDrag.snapX = snap.x;
     g_rasterDrag.snapY = snap.y;
@@ -13005,6 +13077,18 @@ Java_com_bk_drawing_NativeRenderer_beginRasterInteractionAt(
         // selection (imported images).
         g_rasterDrag.initialHalfW = g_rasterSel.halfW;
         g_rasterDrag.initialHalfH = g_rasterSel.halfH;
+        // Which side of the anchor the handle starts on, per local
+        // axis — crossing it mid-drag mirrors the content.
+        {
+            float c = std::cos(-obb.rotation), s = std::sin(-obb.rotation);
+            float wdx = gx - ax, wdy = gy - ay;
+            float ldx = wdx * c - wdy * s;
+            float ldy = wdx * s + wdy * c;
+            g_rasterDrag.initialSignX = (ldx >= 0.0f) ? 1.0f : -1.0f;
+            g_rasterDrag.initialSignY = (ldy >= 0.0f) ? 1.0f : -1.0f;
+            g_rasterDrag.initialFlipX = g_rasterSel.flipX;
+            g_rasterDrag.initialFlipY = g_rasterSel.flipY;
+        }
         return 2;
     }
     // Body hit → move.
@@ -13677,17 +13761,30 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     // for rasters at thumbnail scale.
     g_suppressTextRasterRequests = true;
 
-    // Cached thumbnail FBO + color attachment (resized when dimensions
-    // change). Globals rather than function statics so
-    // resetForNewGlContext can forget them. GL thread only.
+    // Render in chunks of at most kExportChunkPx a side, so the FBO is
+    // never bitmap-sized. Exports are the reason: a big page is
+    // 4300×5980 doc px at 1x and PNG scales go higher, past what one
+    // renderbuffer should be asked for — the page-sized FBO used here
+    // before is what forced Kotlin to clamp export dims to 4096. A
+    // sidebar thumbnail is a single chunk. Each chunk composites the
+    // whole page through the same letterbox transform shifted by the
+    // chunk origin (the viewport clips the rest) and reads back
+    // straight into that chunk's rows of the bitmap.
+    constexpr int kExportChunkPx = 4096;
+    int fboW = std::min(w, kExportChunkPx);
+    int fboH = std::min(h, kExportChunkPx);
+
+    // Cached FBO + color attachment (resized when dimensions change).
+    // Globals rather than function statics so resetForNewGlContext can
+    // forget them. GL thread only.
     GLuint& thumbFbo = g_thumbFbo; GLuint& thumbTex = g_thumbTex;
     int& thumbW = g_thumbW; int& thumbH = g_thumbH;
-    if (thumbW != w || thumbH != h) {
+    if (thumbW != fboW || thumbH != fboH) {
         if (thumbFbo) { glDeleteFramebuffers(1, &thumbFbo); thumbFbo = 0; }
         if (thumbTex) { glDeleteTextures(1, &thumbTex);     thumbTex = 0; }
         glGenTextures(1, &thumbTex);
         glBindTexture(GL_TEXTURE_2D, thumbTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0,
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, fboW, fboH, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -13695,38 +13792,50 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
         glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo);
         glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
                                GL_TEXTURE_2D, thumbTex, 0);
-        thumbW = w; thumbH = h;
+        thumbW = fboW; thumbH = fboH;
     }
-    glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo);
 
-    // compositeAllLayers takes a jfloatArray; wrap our local matrix.
-    jfloatArray transformArr = env->NewFloatArray(16);
-    env->SetFloatArrayRegion(transformArr, 0, 16, t);
     // The page-edge outline is on by default for sidebar thumbnails;
     // disable it for export so the saved PNG / PDF has no border.
     bool savedSkipOutline = g_skipPageOutline;
     g_skipPageOutline = (drawChrome == JNI_FALSE);
-    compositeAllLayers(env, w, h, transformArr);
+
+    // compositeAllLayers takes a jfloatArray; wrap our local matrix.
+    jfloatArray transformArr = env->NewFloatArray(16);
+    std::vector<uint8_t> buf(static_cast<size_t>(fboW) * fboH * 4);
+    for (int cy = 0; cy < h; cy += kExportChunkPx) {
+        int ch = std::min(kExportChunkPx, h - cy);
+        for (int cx = 0; cx < w; cx += kExportChunkPx) {
+            int cw = std::min(kExportChunkPx, w - cx);
+            float tc[16];
+            std::memcpy(tc, t, sizeof(tc));
+            tc[12] -= static_cast<float>(cx);
+            tc[13] -= static_cast<float>(cy);
+            env->SetFloatArrayRegion(transformArr, 0, 16, tc);
+            glBindFramebuffer(GL_FRAMEBUFFER, thumbFbo);
+            compositeAllLayers(env, cw, ch, transformArr);
+
+            // Read the chunk back. The transform's positive y-slope plus
+            // glReadPixels' bottom-up byte order lands doc-top in row 0,
+            // so buf row y is bitmap row (cy + y): a straight memcpy per
+            // row, honouring the bitmap's stride.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, thumbFbo);
+            glReadPixels(0, 0, cw, ch, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
+            void* pixels = nullptr;
+            if (AndroidBitmap_lockPixels(env, bitmap, &pixels) == 0 && pixels) {
+                uint8_t* dst = static_cast<uint8_t*>(pixels);
+                for (int y = 0; y < ch; ++y) {
+                    std::memcpy(dst + static_cast<size_t>(cy + y) * info.stride
+                                    + static_cast<size_t>(cx) * 4,
+                                buf.data() + static_cast<size_t>(y) * cw * 4,
+                                static_cast<size_t>(cw) * 4);
+                }
+                AndroidBitmap_unlockPixels(env, bitmap);
+            }
+        }
+    }
     g_skipPageOutline = savedSkipOutline;
     env->DeleteLocalRef(transformArr);
-
-    // Read pixels back. The bitmap may have stride > w*4 (rare for
-    // ARGB_8888, but possible). Copy row-by-row to honor stride; the
-    // y-flip in our transform already orients doc-top at bitmap-top, so
-    // this is a straight memcpy per row.
-    std::vector<uint8_t> buf(static_cast<size_t>(w) * h * 4);
-    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, buf.data());
-
-    void* pixels = nullptr;
-    if (AndroidBitmap_lockPixels(env, bitmap, &pixels) == 0 && pixels) {
-        uint8_t* dst = static_cast<uint8_t*>(pixels);
-        for (int y = 0; y < h; ++y) {
-            std::memcpy(dst + y * info.stride,
-                        buf.data() + static_cast<size_t>(y) * w * 4,
-                        static_cast<size_t>(w) * 4);
-        }
-        AndroidBitmap_unlockPixels(env, bitmap);
-    }
 
     // Restore caller state.
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
