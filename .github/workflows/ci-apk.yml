@@ -1,0 +1,57 @@
+# Builds the sideloadable "ci" APK (app id com.bk.drawing.ci, label
+# "Drafting Table CI") and publishes it to the rolling "ci-latest"
+# prerelease, so it can be downloaded and installed straight from the
+# tablet's browser without a laptop. Installs alongside the regular app.
+name: CI APK
+
+on:
+  push:
+    branches: ["claude/**", "main", "master"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ci-apk
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build CI APK
+        run: gradle :app:assembleCi -PciVersionCode=${{ github.run_number }} --stacktrace
+
+      - name: Name APK
+        run: |
+          apk=$(ls app/build/outputs/apk/ci/*.apk | head -1)
+          cp "$apk" "drafting-table-ci-${{ github.run_number }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drafting-table-ci-${{ github.run_number }}
+          path: drafting-table-ci-${{ github.run_number }}.apk
+
+      - name: Publish to ci-latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete ci-latest --yes --cleanup-tag || true
+          gh release create ci-latest "drafting-table-ci-${{ github.run_number }}.apk" \
+            --prerelease --target "${{ github.sha }}" \
+            --title "CI build #${{ github.run_number }} (${GITHUB_REF_NAME})" \
+            --notes "Commit ${{ github.sha }} on ${GITHUB_REF_NAME}. Installs as 'Drafting Table CI' next to the regular app."

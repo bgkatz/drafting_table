@@ -11,7 +11,9 @@ android {
         applicationId = "com.bk.drawing"
         minSdk = 33
         targetSdk = 34
-        versionCode = 1
+        // CI passes -PciVersionCode=<run number> so each sideloaded
+        // build installs as an update over the last one.
+        versionCode = (project.findProperty("ciVersionCode") as String?)?.toIntOrNull() ?: 1
         versionName = "0.1"
 
         ndk {
@@ -25,6 +27,19 @@ android {
         }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        manifestPlaceholders["appLabel"] = "@string/app_name"
+    }
+
+    // Fixed key for the "ci" build type, so successive CI builds install
+    // over each other. Debug-only throwaway key (password "android",
+    // same as Android's own debug keystore); never use it for release.
+    signingConfigs {
+        create("ci") {
+            storeFile = file("ci-debug.keystore")
+            storePassword = "android"
+            keyAlias = "cidebug"
+            keyPassword = "android"
+        }
     }
 
     externalNativeBuild {
@@ -35,6 +50,18 @@ android {
     }
 
     buildTypes {
+        // Sideload build from GitHub Actions (.github/workflows/ci-apk.yml).
+        // Separate application id + label, so it installs NEXT TO the
+        // USB-deployed debug app instead of replacing it. Both share the
+        // /sdcard/Drafting Table documents folder — don't run both at once.
+        create("ci") {
+            initWith(getByName("debug"))
+            applicationIdSuffix = ".ci"
+            versionNameSuffix = "-ci"
+            signingConfig = signingConfigs.getByName("ci")
+            manifestPlaceholders["appLabel"] = "Drafting Table CI"
+            matchingFallbacks += listOf("debug")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
