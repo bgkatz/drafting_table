@@ -359,6 +359,8 @@ class GuideOverlayView(
     private val guides: Guides,
     private val docToView: (Float, Float, FloatArray) -> Unit,
     private val viewScale: () -> Float,
+    /** Ruler grip centre (doc-px) into the array; false = no grip now. */
+    private val rulerGrip: (FloatArray) -> Boolean = { false },
 ) : View(context) {
 
     /** Draw the editing handles (ruler ends, compass centre / radius
@@ -474,6 +476,7 @@ class GuideOverlayView(
             drawHandle(canvas, r.x0, r.y0)
             drawHandle(canvas, r.x1, r.y1)
         }
+        drawRulerGrip(canvas, nx, ny)
     }
 
     /** Doc segment a→b shifted by doc offset (ox, oy) into the body. */
@@ -482,6 +485,38 @@ class GuideOverlayView(
         docToView(ax + ox, ay + oy, p)
         docToView(bx + ox, by + oy, q)
         canvas.drawLine(p[0], p[1], q[0], q[1], edgePaint)
+    }
+
+    private val gripDoc = FloatArray(2)
+
+    /** The pen grip: a paper disc with a double arrow across the ruler
+     *  (the direction it slides in hatch steps). */
+    private fun drawRulerGrip(canvas: Canvas, nx: Float, ny: Float) {
+        if (!rulerGrip(gripDoc)) return
+        docToView(gripDoc[0], gripDoc[1], p)
+        val cx = p[0]; val cy = p[1]
+        // View-space direction of the ruler normal.
+        docToView(gripDoc[0] + nx, gripDoc[1] + ny, q)
+        var vx = q[0] - cx; var vy = q[1] - cy
+        val vl = kotlin.math.sqrt(vx * vx + vy * vy)
+        if (vl < 1e-6f) return
+        vx /= vl; vy /= vl
+        val rad = kGripDrawDp * density
+        canvas.drawCircle(cx, cy, rad, handleFill)
+        edgePaint.strokeWidth = 1.4f * density
+        canvas.drawCircle(cx, cy, rad, edgePaint)
+        // Double arrow along the normal.
+        val arm = rad * 0.6f
+        val head = rad * 0.28f
+        val ax = vx * arm; val ay = vy * arm
+        canvas.drawLine(cx - ax, cy - ay, cx + ax, cy + ay, edgePaint)
+        val px = -vy * head; val py = vx * head
+        for (sgn in floatArrayOf(1f, -1f)) {
+            val tx = cx + ax * sgn; val ty = cy + ay * sgn
+            val bx = tx - vx * head * sgn; val by = ty - vy * head * sgn
+            canvas.drawLine(tx, ty, bx + px, by + py, edgePaint)
+            canvas.drawLine(tx, ty, bx - px, by - py, edgePaint)
+        }
     }
 
     private fun isMultiple(t: Float, m: Float): Boolean {
@@ -529,5 +564,8 @@ class GuideOverlayView(
 
     companion object {
         const val kHandleDrawViewDp = 7f
+        /** Ruler grip: drawn radius and pen grab radius (dp). */
+        const val kGripDrawDp = 13f
+        const val kGripHitDp = 24f
     }
 }
