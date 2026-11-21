@@ -26,7 +26,9 @@ import kotlin.math.sin
 // Guides are per document (<docDir>/guides.txt), like a ruler left on
 // the desk while you turn pages. They are drawn by GuideOverlayView, a
 // plain View stacked over the SurfaceView, so they never reach the page
-// pixels, thumbnails or exports.
+// pixels, thumbnails or exports. A finger on a guide holds it (see
+// DrawingSurfaceView.routeFingerGuide), so one hand can slide the ruler
+// while the pen draws.
 
 /** Ruler model. p0→p1 is the *working edge* (edge A, the one with tick
  *  marks, the one position snapping lines up with targets). The body

@@ -417,6 +417,8 @@ class MainActivity : AppCompatActivity() {
             v.onPenLeft     = { brushPreviewView.hide() }
             v.brushPressureSaturation = brushPressureSaturation
             v.guides = guides
+            v.pointSnapEnabled = snapEnabled
+            v.gridSpacingDoc = gridSpacing.toFloat()
             // App-wide (not per doc), like the snap toggles themselves.
             v.angleSnapStepDeg = prefs().getInt(kPrefAngleSnapStep, 15)
             v.onGuidesChanged = { final -> onGuidesChanged(final) }
@@ -4171,6 +4173,7 @@ class MainActivity : AppCompatActivity() {
     private fun toggleSnap() {
         snapEnabled = !snapEnabled
         NativeRenderer.setSnapEnabled(snapEnabled)
+        drawingView?.pointSnapEnabled = snapEnabled
         drawingView?.refreshGuideDrag()
         if (::statusSnapText.isInitialized) {
             statusSnapText.text = if (snapEnabled) "snap: on" else "snap: off"
@@ -4313,6 +4316,7 @@ class MainActivity : AppCompatActivity() {
             else -> { NativeRenderer.setGridStyle(2); NativeRenderer.setGridEnabled(true) }
         }
         NativeRenderer.setGridSpacing(gridSpacing.toFloat())
+        drawingView?.gridSpacingDoc = gridSpacing.toFloat()
         NativeRenderer.setMarginsEnabled(marginsEnabled)
         NativeRenderer.setMarginSizes(marginTop.toFloat(), marginSide.toFloat())
     }
@@ -5095,7 +5099,9 @@ class MainActivity : AppCompatActivity() {
             return
         }
         if (!::statusAngleText.isInitialized) return
-        val text = when (currentToolMirror) {
+        // Whichever guide was just moved, by pen (guide tool) or finger
+        // (any tool).
+        val text = when (drawingView?.lastDraggedGuide) {
             Tool.RULER -> {
                 val r = guides.ruler
                 val deg = Math.round(r.displayAngleDeg() * 10f) / 10f

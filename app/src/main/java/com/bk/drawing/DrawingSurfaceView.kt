@@ -1263,6 +1263,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
         /** Guide handle grab radius (dp) and drag slop (view-px). */
         const val kGuideHitDp = 22f
         const val kGuideSlopViewPx = 6f
+        /** Finger grab: extra reach around the ruler body (dp), and the
+         *  contact size above which a touch is treated as a palm (dp). */
+        const val kFingerSlopDp = 12f
+        const val kPalmTouchMajorDp = 28f
         // Limits on the gesture-driven view scale. The floor is the
         // smaller of kMinViewScale and (fit-to-screen × fraction) — see
         // minViewScale() — so a large page can always be zoomed out to
@@ -1282,6 +1286,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // A finger on the ruler / compass holds it; while it does, the
+        // pen is routed from in there. Otherwise this is a no-op.
+        if (routeFingerGuide(event)) return true
+        return dispatchTouch(event)
+    }
+
+    /** The touch dispatch proper: gestures, palm gate, tool handlers.
+     *  Also fed synthesized pen-only events by routeFingerGuide. */
+    private fun dispatchTouch(event: MotionEvent): Boolean {
         if (handleStylusButton(event)) return true
 
         val r = renderer ?: return super.onTouchEvent(event)
@@ -2231,6 +2244,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 gDownSnapX = gSnap[0]; gDownSnapY = gSnap[1]
                 guideDrag = if (currentTool == Tool.RULER) pickRulerDrag(event)
                             else pickCompassDrag(event)
+                lastDraggedGuide = currentTool
             }
             MotionEvent.ACTION_MOVE -> {
                 if (guideDrag == GuideDrag.NONE) return true
@@ -2441,6 +2455,345 @@ class DrawingSurfaceView @JvmOverloads constructor(
         docToView(x, y, gView)
         return gView[0] >= visibleLeftInset && gView[0] <= width
             && gView[1] >= 0f && gView[1] <= height
+    }
+
+    // ---- Finger-held guides --------------------------------------------
+    //
+    // A finger that lands on the ruler or compass holds it, whatever tool
+    // is active, so the left hand can move the guide while the pen draws
+    // (hatching). routeFingerGuide runs first in onTouchEvent. Once a
+    // finger holds a guide this view owns the whole pointer stream: held
+    // fingers drive the guide, and the pen is handed to the normal tool
+    // dispatch (dispatchTouch) as a synthesized single-pointer event
+    // carrying its own history, so the stroke path sees exactly what it
+    // sees without a finger down. (The routing has to live here: a
+    // sibling overlay holding a finger would be handed every later
+    // pointer by the FrameLayout, the pen included.) Without a finger on
+    // a guide, nothing changes: the event goes straight to dispatchTouch.
+    //
+    // A finger can only grab with the FIRST contact of a gesture, so one
+    // landing while the pen is already down (the drawing hand's palm)
+    // never moves a guide.
+    //
+    //   one finger on the ruler  → slide it, angle fixed; with point snap
+    //                              on, the sideways part steps by the grid
+    //                              spacing (even hatching), along-edge free
+    //   two fingers (second one  → move + rotate (angle snap applies),
+    //   anywhere)                  length fixed
+    //   finger on compass centre → move it; on the ring → resize
+    //
+    // Palm guard: a new grab is refused while the pen is touching, or for
+    // a palm-sized contact; a cancelled pointer (Android's palm rejection
+    // cancels after the fact) puts the guide back where the grab began.
+
+    /** Grid pitch (doc-px), the hatch step. Mirrored by MainActivity. */
+    var gridSpacingDoc: Float = 20f
+    /** Point-snap toggle, mirrored by MainActivity (native holds the
+     *  real flag; this view only needs it for the hatch step). */
+    var pointSnapEnabled: Boolean = true
+
+    /** Guide most recently moved by pen or finger, for the status
+     *  readout: Tool.RULER, Tool.COMPASS or null. */
+    var lastDraggedGuide: Tool? = null
+        private set
+
+    private enum class FingerMode { NONE, RULER, COMPASS_MOVE, COMPASS_RADIUS }
+    private var fingerMode = FingerMode.NONE
+    private var finger1Id = -1
+    private var finger2Id = -1
+    // Pointer doc positions at the start of the current phase (one- or
+    // two-finger), and the guide geometry then.
+    private var fA0x = 0f; private var fA0y = 0f
+    private var fB0x = 0f; private var fB0y = 0f
+    private var fR0x0 = 0f; private var fR0y0 = 0f
+    private var fR0x1 = 0f; private var fR0y1 = 0f
+    private var fC0x = 0f; private var fC0y = 0f
+    // Geometry when the grab began, restored if the touch is cancelled.
+    private val fUndo = FloatArray(6)
+    private val fTmp = FloatArray(6)
+
+    private fun fingerTouchTooBig(event: MotionEvent, index: Int): Boolean =
+        event.getTouchMajor(index) > kPalmTouchMajorDp * resources.displayMetrics.density
+
+    /** Hit-test a finger at view (vx, vy) against the visible guides. */
+    private fun fingerHit(vx: Float, vy: Float): FingerMode {
+        viewToDoc(vx, vy, tmpDoc)
+        val px = tmpDoc[0]; val py = tmpDoc[1]
+        val slopDoc = kFingerSlopDp * resources.displayMetrics.density / viewScale
+        val c = guides.compass
+        if (c.visible && c.radius >= 1f) {
+            if (hypot(px - c.cx, py - c.cy) * viewScale <= guideHitViewPx * 1.4f) {
+                return FingerMode.COMPASS_MOVE
+            }
+        }
+        val r = guides.ruler
+        if (r.visible && r.length >= 1f && r.local(px, py, fTmp)) {
+            val t = fTmp[0]; val s = fTmp[1]
+            if (t >= -slopDoc && t <= r.length + slopDoc
+                && s >= -slopDoc && s <= r.width + slopDoc) {
+                return FingerMode.RULER
+            }
+        }
+        if (c.visible && c.radius >= 1f
+            && c.distanceTo(px, py) * viewScale <= guideHitViewPx * 1.4f) {
+            return FingerMode.COMPASS_RADIUS
+        }
+        return FingerMode.NONE
+    }
+
+    /** Start (or restart, when the finger count changes) a phase from
+     *  the current pointer positions and guide geometry. */
+    private fun beginFingerPhase(event: MotionEvent) {
+        val i1 = event.findPointerIndex(finger1Id)
+        if (i1 < 0) return
+        viewToDoc(event.getX(i1), event.getY(i1), tmpDoc)
+        fA0x = tmpDoc[0]; fA0y = tmpDoc[1]
+        val i2 = if (finger2Id >= 0) event.findPointerIndex(finger2Id) else -1
+        if (i2 >= 0) {
+            viewToDoc(event.getX(i2), event.getY(i2), tmpDoc)
+            fB0x = tmpDoc[0]; fB0y = tmpDoc[1]
+        }
+        val r = guides.ruler
+        fR0x0 = r.x0; fR0y0 = r.y0; fR0x1 = r.x1; fR0y1 = r.y1
+        val c = guides.compass
+        fC0x = c.cx; fC0y = c.cy
+    }
+
+    private fun saveFingerUndo() {
+        val r = guides.ruler; val c = guides.compass
+        fUndo[0] = r.x0; fUndo[1] = r.y0; fUndo[2] = r.x1; fUndo[3] = r.y1
+        fUndo[4] = c.cx; fUndo[5] = c.cy
+        fUndoRadius = c.radius; fUndoHandle = c.handleAngle
+    }
+    private var fUndoRadius = 0f
+    private var fUndoHandle = 0f
+
+    private fun restoreFingerUndo() {
+        val r = guides.ruler; val c = guides.compass
+        r.x0 = fUndo[0]; r.y0 = fUndo[1]; r.x1 = fUndo[2]; r.y1 = fUndo[3]
+        c.cx = fUndo[4]; c.cy = fUndo[5]
+        c.radius = fUndoRadius; c.handleAngle = fUndoHandle
+    }
+
+    private fun endFingerGuide(cancelled: Boolean) {
+        if (fingerMode == FingerMode.NONE) return
+        if (cancelled) restoreFingerUndo()
+        fingerMode = FingerMode.NONE
+        finger1Id = -1; finger2Id = -1
+        onGuidesChanged?.invoke(true)
+    }
+
+    // Pen pointer being routed through synthesized events while a finger
+    // holds a guide; -1 when none.
+    private var routedPenId = -1
+    private var routedPenDownTime = 0L
+    private val synthProps = arrayOf(MotionEvent.PointerProperties())
+    private val synthCoords = arrayOf(MotionEvent.PointerCoords())
+
+    /** Single-pointer copy of pointer `idx` of `e` (history included),
+     *  with the given action. Caller recycles. */
+    private fun penOnlyEvent(e: MotionEvent, idx: Int, action: Int): MotionEvent {
+        e.getPointerProperties(idx, synthProps[0])
+        val hs = e.historySize
+        if (hs > 0) e.getHistoricalPointerCoords(idx, 0, synthCoords[0])
+        else e.getPointerCoords(idx, synthCoords[0])
+        val t0 = if (hs > 0) e.getHistoricalEventTime(0) else e.eventTime
+        val out = MotionEvent.obtain(
+            routedPenDownTime, t0, action, 1, synthProps, synthCoords,
+            e.metaState, e.buttonState, e.xPrecision, e.yPrecision,
+            e.deviceId, e.edgeFlags, e.source, e.flags)
+        for (h in 1 until hs) {
+            e.getHistoricalPointerCoords(idx, h, synthCoords[0])
+            out.addBatch(e.getHistoricalEventTime(h), synthCoords, e.metaState)
+        }
+        if (hs > 0) {
+            e.getPointerCoords(idx, synthCoords[0])
+            out.addBatch(e.eventTime, synthCoords, e.metaState)
+        }
+        return out
+    }
+
+    private fun dispatchRoutedPen(e: MotionEvent, action: Int) {
+        val idx = e.findPointerIndex(routedPenId)
+        if (idx < 0) return
+        val pe = penOnlyEvent(e, idx, action)
+        try { dispatchTouch(pe) } finally { pe.recycle() }
+    }
+
+    /** Runs first for every touch event. True = consumed by the finger-
+     *  held guide (the pen, if any, already dispatched from here). */
+    private fun routeFingerGuide(event: MotionEvent): Boolean {
+        val action = event.actionMasked
+        if (fingerMode == FingerMode.NONE) {
+            if (action != MotionEvent.ACTION_DOWN) return false
+            if (event.getToolType(0) != MotionEvent.TOOL_TYPE_FINGER) return false
+            if (eyedropperPending || fingerTouchTooBig(event, 0)) return false
+            val hit = fingerHit(event.x, event.y)
+            if (hit == FingerMode.NONE) return false
+            fingerMode = hit
+            finger1Id = event.getPointerId(0)
+            finger2Id = -1
+            routedPenId = -1
+            lastDraggedGuide = if (hit == FingerMode.RULER) Tool.RULER else Tool.COMPASS
+            // Same bookkeeping a fresh gesture gets in dispatchTouch.
+            gestureActive = false
+            suppressTouches = false
+            saveFingerUndo()
+            beginFingerPhase(event)
+            return true
+        }
+        when (action) {
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                val idx = event.actionIndex
+                val tt = event.getToolType(idx)
+                if (tt == MotionEvent.TOOL_TYPE_STYLUS && routedPenId < 0) {
+                    routedPenId = event.getPointerId(idx)
+                    routedPenDownTime = event.eventTime
+                    dispatchRoutedPen(event, MotionEvent.ACTION_DOWN)
+                } else if (tt == MotionEvent.TOOL_TYPE_FINGER
+                           && fingerMode == FingerMode.RULER && finger2Id < 0
+                           && routedPenId < 0 && !fingerTouchTooBig(event, idx)) {
+                    finger2Id = event.getPointerId(idx)
+                    beginFingerPhase(event)
+                }
+                // Anything else (a third finger, a finger while the pen is
+                // down) is ignored.
+            }
+            MotionEvent.ACTION_MOVE -> {
+                // A resting finger still produces MOVEs on every pen
+                // sample (one stream); only redraw the overlay when the
+                // guide actually moved, to keep View work off the stroke.
+                if (updateFingerGuide(event)) onGuidesChanged?.invoke(false)
+                if (routedPenId >= 0) dispatchRoutedPen(event, MotionEvent.ACTION_MOVE)
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                val upId = event.getPointerId(event.actionIndex)
+                val cancelled = (event.flags and MotionEvent.FLAG_CANCELED) != 0
+                when (upId) {
+                    routedPenId -> {
+                        dispatchRoutedPen(event,
+                            if (cancelled) MotionEvent.ACTION_CANCEL else MotionEvent.ACTION_UP)
+                        routedPenId = -1
+                    }
+                    finger2Id -> {
+                        finger2Id = -1
+                        if (cancelled) restoreFingerUndo()
+                        beginFingerPhase(event)
+                    }
+                    finger1Id -> {
+                        if (cancelled) restoreFingerUndo()
+                        finger1Id = finger2Id
+                        finger2Id = -1
+                        if (finger1Id >= 0) beginFingerPhase(event)
+                        else releaseFingerGuide(event)
+                    }
+                }
+            }
+            MotionEvent.ACTION_UP -> {
+                // Last pointer: a held finger (the pen leaves via
+                // POINTER_UP while a finger is down).
+                endFingerGuide(
+                    cancelled = (event.flags and MotionEvent.FLAG_CANCELED) != 0)
+                routedPenId = -1
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                if (routedPenId >= 0) dispatchRoutedPen(event, MotionEvent.ACTION_CANCEL)
+                routedPenId = -1
+                endFingerGuide(cancelled = true)
+            }
+        }
+        return true
+    }
+
+    /** The last holding finger lifted while other pointers remain. A pen
+     *  still drawing carries on through the normal path (its stroke was
+     *  begun by a synthesized DOWN, and its events now arrive as plain
+     *  single-pointer MOVE / UP). Stray fingers are swallowed until
+     *  they lift, like the tail of a two-finger gesture. */
+    private fun releaseFingerGuide(event: MotionEvent) {
+        val penStillDown = routedPenId >= 0
+        endFingerGuide(cancelled = false)
+        routedPenId = -1
+        if (!penStillDown && event.pointerCount > 1) suppressTouches = true
+    }
+
+    /** Apply the held fingers to the guide. True if it moved. */
+    private fun updateFingerGuide(event: MotionEvent): Boolean {
+        val r = guides.ruler; val c = guides.compass
+        val bx0 = r.x0; val by0 = r.y0; val bx1 = r.x1; val by1 = r.y1
+        val bcx = c.cx; val bcy = c.cy; val brad = c.radius
+        applyFingerGuide(event)
+        return r.x0 != bx0 || r.y0 != by0 || r.x1 != bx1 || r.y1 != by1
+            || c.cx != bcx || c.cy != bcy || c.radius != brad
+    }
+
+    private fun applyFingerGuide(event: MotionEvent) {
+        val i1 = event.findPointerIndex(finger1Id)
+        if (i1 < 0) return
+        viewToDoc(event.getX(i1), event.getY(i1), tmpDoc)
+        val ax = tmpDoc[0]; val ay = tmpDoc[1]
+        when (fingerMode) {
+            FingerMode.RULER -> {
+                val r = guides.ruler
+                val i2 = if (finger2Id >= 0) event.findPointerIndex(finger2Id) else -1
+                if (i2 >= 0) {
+                    // Two fingers: rigid move + rotate about the fingers'
+                    // midpoint. Length never changes.
+                    viewToDoc(event.getX(i2), event.getY(i2), tmpDoc)
+                    val bx = tmpDoc[0]; val by = tmpDoc[1]
+                    val a0 = atan2(fB0y - fA0y, fB0x - fA0x)
+                    val a1 = atan2(by - ay, bx - ax)
+                    var rot = a1 - a0
+                    if (angleSnapEnabled) {
+                        val base = atan2(fR0y1 - fR0y0, fR0x1 - fR0x0)
+                        val step = Math.toRadians(angleSnapStepDeg.toDouble()).toFloat()
+                        val snapped = kotlin.math.round((base + rot) / step) * step
+                        rot = snapped - base
+                    }
+                    val m0x = (fA0x + fB0x) * 0.5f; val m0y = (fA0y + fB0y) * 0.5f
+                    val mx = (ax + bx) * 0.5f;     val my = (ay + by) * 0.5f
+                    val cr = cos(rot); val sr = sin(rot)
+                    fun mapX(x: Float, y: Float) = mx + cr * (x - m0x) - sr * (y - m0y)
+                    fun mapY(x: Float, y: Float) = my + sr * (x - m0x) + cr * (y - m0y)
+                    r.x0 = mapX(fR0x0, fR0y0); r.y0 = mapY(fR0x0, fR0y0)
+                    r.x1 = mapX(fR0x1, fR0y1); r.y1 = mapY(fR0x1, fR0y1)
+                } else {
+                    // One finger: slide, angle fixed. Sideways part steps
+                    // by the grid pitch when snap is on, so successive
+                    // hatch lines come out evenly spaced.
+                    val len = hypot(fR0x1 - fR0x0, fR0y1 - fR0y0)
+                    if (len < 1e-3f) return
+                    val ux = (fR0x1 - fR0x0) / len; val uy = (fR0y1 - fR0y0) / len
+                    val nx = -uy; val ny = ux
+                    val dx = ax - fA0x; val dy = ay - fA0y
+                    val along = dx * ux + dy * uy
+                    var side = dx * nx + dy * ny
+                    val step = gridSpacingDoc
+                    if (pointSnapEnabled && step >= 1f) {
+                        side = kotlin.math.round(side / step) * step
+                    }
+                    val ox = ux * along + nx * side
+                    val oy = uy * along + ny * side
+                    r.x0 = fR0x0 + ox; r.y0 = fR0y0 + oy
+                    r.x1 = fR0x1 + ox; r.y1 = fR0y1 + oy
+                }
+            }
+            FingerMode.COMPASS_MOVE -> {
+                val c = guides.compass
+                snapGuidePoint(fC0x + (ax - fA0x), fC0y + (ay - fA0y))
+                c.cx = gSnap[0]; c.cy = gSnap[1]
+            }
+            FingerMode.COMPASS_RADIUS -> {
+                val c = guides.compass
+                snapGuidePoint(ax, ay)
+                val rad = hypot(gSnap[0] - c.cx, gSnap[1] - c.cy)
+                if (rad >= 1f) {
+                    c.radius = rad
+                    c.handleAngle = atan2(gSnap[1] - c.cy, gSnap[0] - c.cx)
+                }
+            }
+            FingerMode.NONE -> {}
+        }
     }
 
     private var pageBoundsInitialized = false
