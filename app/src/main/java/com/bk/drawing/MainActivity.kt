@@ -230,6 +230,7 @@ class MainActivity : AppCompatActivity() {
     private val kPrefVectorWidth   = "vector_line_width"
     private val kPrefStylusOnly    = "stylus_only"
     private val kPrefPixelGrid     = "pixel_grid_enabled"
+    private val kPrefAngleSnapStep = "angle_snap_step_deg"
     private val kPrefBrushAlpha    = "brush_alpha"
     private val kPrefStrokeUniformAlpha = "stroke_uniform_alpha"
     private val kPrefPreserveAspect = "preserve_aspect"
@@ -416,6 +417,8 @@ class MainActivity : AppCompatActivity() {
             v.onPenLeft     = { brushPreviewView.hide() }
             v.brushPressureSaturation = brushPressureSaturation
             v.guides = guides
+            // App-wide (not per doc), like the snap toggles themselves.
+            v.angleSnapStepDeg = prefs().getInt(kPrefAngleSnapStep, 15)
             v.onGuidesChanged = { final -> onGuidesChanged(final) }
             bodyContainer.addView(
                 v,
@@ -2932,15 +2935,15 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (snapEnabled) R.color.hot else R.color.inkSoft))
         }
-        // Angle snap — line tool's endpoint locks to multiples of 15°.
-        // Toggleable here AND from the stylus middle button when a
-        // vector layer is active.
+        // Angle snap — line / ruler / rotation drags lock to multiples
+        // of the step (default 15°). Toggleable here AND from the stylus
+        // middle button when a vector layer or a positioning tool is
+        // active. Long-press opens the step slider, like the grid chip.
         val angleOn = drawingView?.angleSnapEnabled == true
-        statusAngleText = makeStatusText(
-            if (angleOn) "angle: on" else "angle: off"
-        ).apply {
+        statusAngleText = makeStatusText(angleChipLabel()).apply {
             isClickable = true; isFocusable = true
             setOnClickListener { toggleAngleSnap() }
+            setOnLongClickListener { showAngleSnapPopup(this); true }
             setTextColor(getColor(
                 if (angleOn) R.color.hot else R.color.inkSoft))
         }
@@ -4189,7 +4192,7 @@ class MainActivity : AppCompatActivity() {
     private fun refreshAngleSnapStatus() {
         if (!::statusAngleText.isInitialized) return
         val on = drawingView?.angleSnapEnabled == true
-        statusAngleText.text = if (on) "angle: on" else "angle: off"
+        statusAngleText.text = angleChipLabel()
         statusAngleText.setTextColor(getColor(
             if (on) R.color.hot else R.color.inkSoft))
     }
@@ -4338,6 +4341,37 @@ class MainActivity : AppCompatActivity() {
         ))
     }
 
+    /** "angle: on · 15°" / "angle: off". */
+    private fun angleChipLabel(): String {
+        val v = drawingView
+        return if (v?.angleSnapEnabled == true) "angle: on · ${v.angleSnapStepDeg}°"
+               else "angle: off"
+    }
+
+    /** Long-press on the angle chip: one slider for the snap step, in
+     *  whole degrees. App-wide pref rather than per doc. Opening it
+     *  turns angle snap on, so the step has something to act on. */
+    private fun showAngleSnapPopup(anchor: View) {
+        val v = drawingView ?: return
+        if (!v.angleSnapEnabled) {
+            v.angleSnapEnabled = true
+            v.refreshGuideDrag()
+        }
+        refreshAngleSnapStatus()
+        showPaperSliderPopup(anchor, "Angle snap", listOf(
+            PaperSliderSpec("step°", 1, 90,
+                            get = { v.angleSnapStepDeg },
+                            set = { v.angleSnapStepDeg = it }),
+        ),
+        onChange = {
+            refreshAngleSnapStatus()
+            v.refreshGuideDrag()
+        },
+        onCommit = {
+            prefs().edit().putInt(kPrefAngleSnapStep, v.angleSnapStepDeg).apply()
+        })
+    }
+
     /** Long-press on the margins chip: top/bottom and side insets. Opening
      *  the popup turns margins on if they're off, so the sliders have
      *  something to show. */
@@ -4374,6 +4408,13 @@ class MainActivity : AppCompatActivity() {
      *  (same cadence as the brush sliders' pref writes). */
     private fun showPaperSliderPopup(
         anchor: View, title: String, specs: List<PaperSliderSpec>,
+        // Defaults are the page-setup behaviour (grid / margins): push to
+        // native + redraw live, write the per-doc file on thumb lift.
+        onChange: () -> Unit = {
+            applyPageSetupToNative()
+            drawingView?.forceRedraw()
+        },
+        onCommit: () -> Unit = { writePageSetup(docDirFor(currentDocName)) },
     ) {
         val paper = getColor(R.color.paper)
         val container = LinearLayout(this).apply {
@@ -4410,12 +4451,11 @@ class MainActivity : AppCompatActivity() {
                         valueLabel.text = v.toString()
                         if (!fromUser) return
                         spec.set(v)
-                        applyPageSetupToNative()
-                        drawingView?.forceRedraw()
+                        onChange()
                     }
                     override fun onStartTrackingTouch(sb: SeekBar?) {}
                     override fun onStopTrackingTouch(sb: SeekBar?) {
-                        writePageSetup(docDirFor(currentDocName))
+                        onCommit()
                     }
                 })
             }
@@ -4423,9 +4463,8 @@ class MainActivity : AppCompatActivity() {
                 val v = typed.toInt().coerceIn(spec.min, spec.max)
                 slider.progress = v - spec.min
                 spec.set(v)
-                applyPageSetupToNative()
-                drawingView?.forceRedraw()
-                writePageSetup(docDirFor(currentDocName))
+                onChange()
+                onCommit()
             }
             container.addView(row,
                 LinearLayout.LayoutParams(

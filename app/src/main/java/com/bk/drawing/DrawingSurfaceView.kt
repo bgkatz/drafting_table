@@ -966,7 +966,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
     var onSnapToggleRequested: (() -> Unit)? = null
 
     /** Constrain a freshly-drawn LINE-tool stroke's angle to a multiple
-     *  of 15°, AND lock rotation/Line-endpoint drags to the same
+     *  of angleSnapStepDeg, AND lock rotation/Line-endpoint drags to the same
      *  step. Off by default. Toggleable from the status bar and from
      *  the stylus middle button when a vector layer or shape tool is
      *  active. The setter mirrors the new value into native via
@@ -977,6 +977,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
             field = value
             NativeRenderer.setAngleSnapEnabled(value)
         }
+    /** Angle-snap step in whole degrees, 1..90 (default 15). Set from
+     *  the angle chip's long-press slider; mirrored to native so shape
+     *  rotation / line-endpoint drags use the same step. */
+    var angleSnapStepDeg: Int = 15
+        set(value) {
+            field = value.coerceIn(1, 90)
+            NativeRenderer.setAngleSnapStep(field.toFloat())
+        }
+
     /** Notified after toggleTool flips angleSnapEnabled, so the UI
      *  status indicator can re-paint. */
     var onAngleSnapChanged: ((Boolean) -> Unit)? = null
@@ -1986,8 +1995,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     /** Snap the LINE-tool endpoint's *direction* from p0 to a multiple
-     *  of 15°, preserving distance from p0. Returns (x, y, stepIdx)
-     *  where stepIdx is the integer multiple of 15° that was selected
+     *  of angleSnapStepDeg, preserving distance from p0. Returns (x, y, stepIdx)
+     *  where stepIdx is the integer multiple of the step that was selected
      *  — caller uses it to display the exact snapped angle without
      *  going through an atan2(cos, sin) round-trip that can shave a
      *  degree off due to float precision. stepIdx == Int.MIN_VALUE
@@ -1999,7 +2008,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         val dy = p1y - p0y
         val dist = kotlin.math.sqrt(dx * dx + dy * dy)
         if (dist < 1.0f) return AngleSnapResult(p1x, p1y, Int.MIN_VALUE)
-        val step = kotlin.math.PI.toFloat() / 12f          // 15°
+        val step = Math.toRadians(angleSnapStepDeg.toDouble()).toFloat()
         val ang  = kotlin.math.atan2(dy, dx)
         val k    = kotlin.math.round(ang / step).toInt()
         val snappedAng = k * step
@@ -2114,12 +2123,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     val r = applyAngleSnap(shapeP0X, shapeP0Y, sx, sy)
                     shapeP1X = r.x; shapeP1Y = r.y
                     if (r.stepIdx != Int.MIN_VALUE) {
-                        // 15° increments. Convert from doc-coord
-                        // convention (y down, so a positive stepIdx
-                        // means clockwise from +x) to display
-                        // convention (90°=up). dispDeg = -k * 15
+                        // angleSnapStepDeg increments. Convert from
+                        // doc-coord convention (y down, so a positive
+                        // stepIdx means clockwise from +x) to display
+                        // convention (90°=up). dispDeg = -k * step
                         // wrapped into [0, 360).
-                        var deg = (-r.stepIdx * 15) % 360
+                        var deg = (-r.stepIdx * angleSnapStepDeg) % 360
                         if (deg < 0) deg += 360
                         onLineAngleChanged?.invoke(deg.toFloat())
                     }
