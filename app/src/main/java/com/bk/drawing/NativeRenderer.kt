@@ -278,6 +278,10 @@ object NativeRenderer {
      */
     external fun setAngleSnapEnabled(enabled: Boolean)
 
+    /** Angle-snap step in degrees (1..90, default 15). Used by every
+     *  native angle snap (line endpoint drags, rotations). */
+    external fun setAngleSnapStep(degrees: Float)
+
     /**
      * SELECT panel "keep aspect" toggle. When on, corner-handle scale
      * drags of a raster selection, Rect, or Ellipse scale both axes

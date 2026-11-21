@@ -198,6 +198,13 @@ class MainActivity : AppCompatActivity() {
     private var brushSizeScale = 1.0f
     private var brushPreviewEnabled = false
     private lateinit var brushPreviewView: BrushPreviewView
+
+    // ---- Drafting guides (ruler / compass) ----------------------------
+    // Per document, <docDir>/guides.txt. The model is shared with the
+    // canvas (which constrains strokes against it and drags it around);
+    // the overlay draws it above the SurfaceView.
+    private val guides = Guides()
+    private lateinit var guideOverlay: GuideOverlayView
     // Motion-prediction toggle. On by default — prediction is the
     // validated low-latency path; the toggle is kept so we can drop
     // back to raw pen tracking if an edge case appears. Not persisted
@@ -223,6 +230,7 @@ class MainActivity : AppCompatActivity() {
     private val kPrefVectorWidth   = "vector_line_width"
     private val kPrefStylusOnly    = "stylus_only"
     private val kPrefPixelGrid     = "pixel_grid_enabled"
+    private val kPrefAngleSnapStep = "angle_snap_step_deg"
     private val kPrefBrushAlpha    = "brush_alpha"
     private val kPrefStrokeUniformAlpha = "stroke_uniform_alpha"
     private val kPrefPreserveAspect = "preserve_aspect"
@@ -408,6 +416,12 @@ class MainActivity : AppCompatActivity() {
             v.onPenPosition = { x, y, _ -> updateBrushPreview(x, y) }
             v.onPenLeft     = { brushPreviewView.hide() }
             v.brushPressureSaturation = brushPressureSaturation
+            v.guides = guides
+            v.pointSnapEnabled = snapEnabled
+            v.gridSpacingDoc = gridSpacing.toFloat()
+            // App-wide (not per doc), like the snap toggles themselves.
+            v.angleSnapStepDeg = prefs().getInt(kPrefAngleSnapStep, 15)
+            v.onGuidesChanged = { final -> onGuidesChanged(final) }
             bodyContainer.addView(
                 v,
                 FrameLayout.LayoutParams(
@@ -417,6 +431,17 @@ class MainActivity : AppCompatActivity() {
             )
         }
         drawingView = canvas
+
+        // Ruler / compass overlay, directly above the canvas (and below
+        // the brush preview, the text editor and the panels). Not
+        // clickable, so every touch reaches the SurfaceView.
+        guideOverlay = GuideOverlayView(this, guides,
+            docToView = { x, y, out -> canvas.docToView(x, y, out) },
+            viewScale = { canvas.currentViewScale },
+            rulerGrip = { out -> canvas.rulerGripDoc(out) })
+        bodyContainer.addView(guideOverlay, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT))
 
         // Text boxes: the edit overlay lives in bodyContainer on top of
         // the canvas; the controller also answers native's raster
@@ -434,7 +459,10 @@ class MainActivity : AppCompatActivity() {
         textEditor.onStyleTargetChanged = { refreshTextPanel() }
         textEditor.bindPrefs(prefs())
         canvas.onTextRasterNeeded   = { textEditor.rasterizeRequested() }
-        canvas.onViewTransformChanged = { textEditor.reposition() }
+        canvas.onViewTransformChanged = {
+            textEditor.reposition()
+            guideOverlay.invalidate()
+        }
         // A tap outside an open text box only closes it; the next tap
         // places a new one.
         canvas.onCanvasTouchDown    = { textEditor.commitIfOpen() }
@@ -640,6 +668,10 @@ class MainActivity : AppCompatActivity() {
         rail.addView(makeRailToolTile(Tool.ERASER,  R.drawable.ic_eraser, "eraser"))
         rail.addView(makeRailToolTile(Tool.BUCKET,  R.drawable.ic_bucket, "bucket"))
         rail.addView(makeRailToolTile(Tool.SHADE,   R.drawable.ic_shade,  "shade"))
+        // Drafting guides. Tap selects the tool (and shows the guide);
+        // tapping the active tile again shows / hides the guide.
+        rail.addView(makeRailGuideTile(Tool.RULER,   R.drawable.ic_ruler,   "ruler"))
+        rail.addView(makeRailGuideTile(Tool.COMPASS, R.drawable.ic_compass, "compass"))
 
         rail.addView(railRule())
         rail.addView(railSectionLabel("VECTOR"))
@@ -718,6 +750,14 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
     }
 
+    private fun makeRailGuideTile(tool: Tool, iconRes: Int, label: String): ImageView {
+        val tile = toolTile(iconRes, label, isToggle = false) {
+            drawingView?.onGuideToolTapped(tool)
+        } as ImageView
+        railToolTiles[tool] = tile
+        return tile
+    }
+
     private fun makeRailToolTile(tool: Tool, iconRes: Int, label: String): ImageView {
         val tile = toolTile(iconRes, label, isToggle = false) { drawingView?.setTool(tool) }
                 as ImageView
@@ -735,7 +775,7 @@ class MainActivity : AppCompatActivity() {
      * still exceeds the icons' 24dp intrinsic size, so trimming the
      * tile trims dead space only; CENTER_INSIDE never upscales, so the
      * glyphs render at exactly the same size they did at 44dp.
-     * Budget: 15 tiles x 40dp pitch + rules/labels ~= 685dp.
+     * Budget: 17 tiles x 40dp pitch + rules/labels ~= 765dp.
      */
     private fun toolTile(iconRes: Int, label: String,
                          isToggle: Boolean,
@@ -771,6 +811,12 @@ class MainActivity : AppCompatActivity() {
     private fun onToolChanged(tool: Tool) {
         for ((t, tile) in railToolTiles) tile.isSelected = (t == tool)
         currentToolMirror = tool
+        if (::guideOverlay.isInitialized) {
+            guideOverlay.showRulerHandles   = tool == Tool.RULER
+            guideOverlay.showCompassHandles = tool == Tool.COMPASS
+            // The ruler's pen grip shows only for the stroke tools.
+            guideOverlay.invalidate()
+        }
         // Leaving the text tool with the editor open commits the text.
         if (tool != Tool.TEXT && ::textEditor.isInitialized) textEditor.commitIfOpen()
         if (::statusToolText.isInitialized) {
@@ -801,6 +847,8 @@ class MainActivity : AppCompatActivity() {
             Tool.SELECT       -> "select"
             Tool.SELECT_RECT  -> "select"   // unified raster + vector
             Tool.SELECT_LASSO -> "lasso"
+            Tool.RULER        -> "ruler"
+            Tool.COMPASS      -> "compass"
         }
 
     // ====================================================================
@@ -2892,15 +2940,15 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (snapEnabled) R.color.hot else R.color.inkSoft))
         }
-        // Angle snap — line tool's endpoint locks to multiples of 15°.
-        // Toggleable here AND from the stylus middle button when a
-        // vector layer is active.
+        // Angle snap — line / ruler / rotation drags lock to multiples
+        // of the step (default 15°). Toggleable here AND from the stylus
+        // middle button when a vector layer or a positioning tool is
+        // active. Long-press opens the step slider, like the grid chip.
         val angleOn = drawingView?.angleSnapEnabled == true
-        statusAngleText = makeStatusText(
-            if (angleOn) "angle: on" else "angle: off"
-        ).apply {
+        statusAngleText = makeStatusText(angleChipLabel()).apply {
             isClickable = true; isFocusable = true
             setOnClickListener { toggleAngleSnap() }
+            setOnLongClickListener { showAngleSnapPopup(this); true }
             setTextColor(getColor(
                 if (angleOn) R.color.hot else R.color.inkSoft))
         }
@@ -4128,6 +4176,8 @@ class MainActivity : AppCompatActivity() {
     private fun toggleSnap() {
         snapEnabled = !snapEnabled
         NativeRenderer.setSnapEnabled(snapEnabled)
+        drawingView?.pointSnapEnabled = snapEnabled
+        drawingView?.refreshGuideDrag()
         if (::statusSnapText.isInitialized) {
             statusSnapText.text = if (snapEnabled) "snap: on" else "snap: off"
             statusSnapText.setTextColor(getColor(
@@ -4142,12 +4192,13 @@ class MainActivity : AppCompatActivity() {
         val v = drawingView ?: return
         v.angleSnapEnabled = !v.angleSnapEnabled
         refreshAngleSnapStatus()
+        v.refreshGuideDrag()
     }
 
     private fun refreshAngleSnapStatus() {
         if (!::statusAngleText.isInitialized) return
         val on = drawingView?.angleSnapEnabled == true
-        statusAngleText.text = if (on) "angle: on" else "angle: off"
+        statusAngleText.text = angleChipLabel()
         statusAngleText.setTextColor(getColor(
             if (on) R.color.hot else R.color.inkSoft))
     }
@@ -4268,6 +4319,7 @@ class MainActivity : AppCompatActivity() {
             else -> { NativeRenderer.setGridStyle(2); NativeRenderer.setGridEnabled(true) }
         }
         NativeRenderer.setGridSpacing(gridSpacing.toFloat())
+        drawingView?.gridSpacingDoc = gridSpacing.toFloat()
         NativeRenderer.setMarginsEnabled(marginsEnabled)
         NativeRenderer.setMarginSizes(marginTop.toFloat(), marginSide.toFloat())
     }
@@ -4294,6 +4346,37 @@ class MainActivity : AppCompatActivity() {
                             get = { gridSpacing },
                             set = { gridSpacing = it }),
         ))
+    }
+
+    /** "angle: on · 15°" / "angle: off". */
+    private fun angleChipLabel(): String {
+        val v = drawingView
+        return if (v?.angleSnapEnabled == true) "angle: on · ${v.angleSnapStepDeg}°"
+               else "angle: off"
+    }
+
+    /** Long-press on the angle chip: one slider for the snap step, in
+     *  whole degrees. App-wide pref rather than per doc. Opening it
+     *  turns angle snap on, so the step has something to act on. */
+    private fun showAngleSnapPopup(anchor: View) {
+        val v = drawingView ?: return
+        if (!v.angleSnapEnabled) {
+            v.angleSnapEnabled = true
+            v.refreshGuideDrag()
+        }
+        refreshAngleSnapStatus()
+        showPaperSliderPopup(anchor, "Angle snap", listOf(
+            PaperSliderSpec("step°", 1, 90,
+                            get = { v.angleSnapStepDeg },
+                            set = { v.angleSnapStepDeg = it }),
+        ),
+        onChange = {
+            refreshAngleSnapStatus()
+            v.refreshGuideDrag()
+        },
+        onCommit = {
+            prefs().edit().putInt(kPrefAngleSnapStep, v.angleSnapStepDeg).apply()
+        })
     }
 
     /** Long-press on the margins chip: top/bottom and side insets. Opening
@@ -4332,6 +4415,13 @@ class MainActivity : AppCompatActivity() {
      *  (same cadence as the brush sliders' pref writes). */
     private fun showPaperSliderPopup(
         anchor: View, title: String, specs: List<PaperSliderSpec>,
+        // Defaults are the page-setup behaviour (grid / margins): push to
+        // native + redraw live, write the per-doc file on thumb lift.
+        onChange: () -> Unit = {
+            applyPageSetupToNative()
+            drawingView?.forceRedraw()
+        },
+        onCommit: () -> Unit = { writePageSetup(docDirFor(currentDocName)) },
     ) {
         val paper = getColor(R.color.paper)
         val container = LinearLayout(this).apply {
@@ -4368,12 +4458,11 @@ class MainActivity : AppCompatActivity() {
                         valueLabel.text = v.toString()
                         if (!fromUser) return
                         spec.set(v)
-                        applyPageSetupToNative()
-                        drawingView?.forceRedraw()
+                        onChange()
                     }
                     override fun onStartTrackingTouch(sb: SeekBar?) {}
                     override fun onStopTrackingTouch(sb: SeekBar?) {
-                        writePageSetup(docDirFor(currentDocName))
+                        onCommit()
                     }
                 })
             }
@@ -4381,9 +4470,8 @@ class MainActivity : AppCompatActivity() {
                 val v = typed.toInt().coerceIn(spec.min, spec.max)
                 slider.progress = v - spec.min
                 spec.set(v)
-                applyPageSetupToNative()
-                drawingView?.forceRedraw()
-                writePageSetup(docDirFor(currentDocName))
+                onChange()
+                onCommit()
             }
             container.addView(row,
                 LinearLayout.LayoutParams(
@@ -4581,6 +4669,7 @@ class MainActivity : AppCompatActivity() {
         val docDir = docDirFor(initialDoc).apply { mkdirs() }
         NativeRenderer.setDocumentDir(docDir.absolutePath)
         loadPageSetup(docDir)
+        loadGuides(docDir)
 
         drawingView?.post {
             syncLayerStateFromNative()
@@ -4689,6 +4778,7 @@ class MainActivity : AppCompatActivity() {
         currentDocName = name
         rememberDocName(name)
         loadPageSetup(dir)
+        loadGuides(dir)
         if (::statusDocText.isInitialized) statusDocText.text = "doc · $name"
         NativeRenderer.loadDocument(dir.absolutePath)
         drawingView?.forceRedraw()
@@ -4978,6 +5068,61 @@ class MainActivity : AppCompatActivity() {
         }
         applyPageSetupToNative()
         refreshPageSetupChips()
+    }
+
+    // ---- Drafting guides -------------------------------------------------
+
+    private val kGuidesFile = "guides.txt"
+
+    /** Load [dir]'s ruler / compass. A doc with no file starts with both
+     *  hidden (unlike page setup, guides aren't inherited). */
+    private fun loadGuides(dir: java.io.File) {
+        val f = java.io.File(dir, kGuidesFile)
+        val text = if (f.exists()) runCatching { f.readText() }.getOrNull() else null
+        guides.load(text)
+        if (::guideOverlay.isInitialized) guideOverlay.invalidate()
+    }
+
+    private fun writeGuides() {
+        if (currentDocName.isEmpty()) return
+        runCatching {
+            java.io.File(docDirFor(currentDocName), kGuidesFile)
+                .writeText(guides.serialize())
+        }.onFailure { android.util.Log.e("DrawingApp", "writeGuides failed", it) }
+    }
+
+    /** Canvas callback: a guide moved (`final` = false, mid-drag) or a
+     *  drag / show / hide finished (`final` = true). Mid-drag the angle
+     *  chip doubles as a readout, like it does for the line tool. */
+    private fun onGuidesChanged(final: Boolean) {
+        if (::guideOverlay.isInitialized) guideOverlay.invalidate()
+        if (final) {
+            writeGuides()
+            refreshAngleSnapStatus()
+            return
+        }
+        if (!::statusAngleText.isInitialized) return
+        // Whichever guide was just moved, by pen (guide tool) or finger
+        // (any tool).
+        val text = when (drawingView?.lastDraggedGuide) {
+            Tool.RULER -> {
+                val r = guides.ruler
+                val deg = Math.round(r.displayAngleDeg() * 10f) / 10f
+                "ruler: ${deg}° · ${lengthLabel(r.length)}"
+            }
+            Tool.COMPASS -> "compass: r ${lengthLabel(guides.compass.radius)}"
+            else -> return
+        }
+        statusAngleText.text = text
+        statusAngleText.setTextColor(getColor(R.color.hot))
+    }
+
+    /** "812 px · 103.1 mm", the mm from the export dpi (the size the
+     *  page prints at). */
+    private fun lengthLabel(docPx: Float): String {
+        val dpi = prefs().getInt("export_dpi", kExportDpiDefault).coerceAtLeast(1)
+        val mm = docPx / dpi * 25.4f
+        return "%d px · %.1f mm".format(Math.round(docPx), mm)
     }
 
     private fun writePageSetup(dir: java.io.File) {

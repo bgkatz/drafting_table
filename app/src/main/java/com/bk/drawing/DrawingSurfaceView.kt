@@ -157,7 +157,12 @@ enum class Tool(val nativeId: Int) {
     // Closed-path fill: traces a brush stroke, joins start to end with a
     // straight chord, and fills the enclosed region. Same raster stroke
     // pipeline as BRUSH — see kToolShade in renderer.cpp.
-    SHADE      (7);
+    SHADE      (7),
+    // Drafting guides. No native id: dragging positions the ruler /
+    // compass (Guides.kt); the constraint they impose is applied to the
+    // raster stroke tools' samples in handleStrokeEvent.
+    RULER      (-1),
+    COMPASS    (-1);
 
     /** Shape-type code passed to NativeRenderer for shape tools. */
     val shapeType: Int
@@ -873,11 +878,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
                        || currentTool == Tool.RECTANGLE
                        || currentTool == Tool.CIRCLE
                        || currentTool == Tool.ELLIPSE
-        if (activeIsVector || isShapeTool) {
+        // The guide tools position things like a shape tool does, so the
+        // middle button means angle snap for them too.
+        val isGuideTool = currentTool == Tool.RULER || currentTool == Tool.COMPASS
+        if (activeIsVector || isShapeTool || isGuideTool) {
             angleSnapEnabled = !angleSnapEnabled
             Log.i("DrawingApp",
                   "angle snap -> ${if (angleSnapEnabled) "on" else "off"}")
             onAngleSnapChanged?.invoke(angleSnapEnabled)
+            refreshGuideDrag()
             return
         }
         // Auto-commit any floating raster selection before swapping tools
@@ -957,7 +966,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
     var onSnapToggleRequested: (() -> Unit)? = null
 
     /** Constrain a freshly-drawn LINE-tool stroke's angle to a multiple
-     *  of 15°, AND lock rotation/Line-endpoint drags to the same
+     *  of angleSnapStepDeg, AND lock rotation/Line-endpoint drags to the same
      *  step. Off by default. Toggleable from the status bar and from
      *  the stylus middle button when a vector layer or shape tool is
      *  active. The setter mirrors the new value into native via
@@ -968,6 +977,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
             field = value
             NativeRenderer.setAngleSnapEnabled(value)
         }
+    /** Angle-snap step in whole degrees, 1..90 (default 15). Set from
+     *  the angle chip's long-press slider; mirrored to native so shape
+     *  rotation / line-endpoint drags use the same step. */
+    var angleSnapStepDeg: Int = 15
+        set(value) {
+            field = value.coerceIn(1, 90)
+            NativeRenderer.setAngleSnapStep(field.toFloat())
+        }
+
     /** Notified after toggleTool flips angleSnapEnabled, so the UI
      *  status indicator can re-paint. */
     var onAngleSnapChanged: ((Boolean) -> Unit)? = null
@@ -1135,9 +1153,19 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // doesn't bleed into a stroke or transform on gesture release.
         when (currentTool) {
             Tool.BRUSH, Tool.ERASER, Tool.SHADE -> {
-                NativeRenderer.discardStroke()
-                cancelNextCommit = true
-                renderer?.commit()
+                if (gripDragging) {
+                    // Keep wherever the grip drag got to.
+                    endGripDrag()
+                } else {
+                    NativeRenderer.discardStroke()
+                    cancelNextCommit = true
+                    renderer?.commit()
+                    guides.endStroke()
+                }
+            }
+            Tool.RULER, Tool.COMPASS -> {
+                // Keep wherever the drag got to; a pinch just ends it.
+                endGuideDrag()
             }
             Tool.BUCKET -> {
                 // Click-to-act, nothing in flight to cancel.
@@ -1237,6 +1265,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
         /** View-px the pen must travel before a TEXT tap becomes a
          *  drag-to-place. */
         const val kTextDragSlopPx = 14f
+        /** Guide handle grab radius (dp) and drag slop (view-px). */
+        const val kGuideHitDp = 22f
+        const val kGuideSlopViewPx = 6f
         // Limits on the gesture-driven view scale. The floor is the
         // smaller of kMinViewScale and (fit-to-screen × fraction) — see
         // minViewScale() — so a large page can always be zoomed out to
@@ -1381,6 +1412,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
             Tool.BRUSH, Tool.ERASER, Tool.SHADE -> handleStrokeEvent(r, event)
             Tool.BUCKET             -> handleBucketEvent(event)
             Tool.TEXT               -> handleTextEvent(r, event)
+            Tool.RULER, Tool.COMPASS -> handleGuideEvent(event)
             Tool.SELECT             -> handleSelectEvent(r, event)
             // The marquee/rectangle and lasso selection tools dispatch
             // by active layer type: raster → lift pixels into a
@@ -1840,6 +1872,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
         r: GLFrontBufferedRenderer<StrokeAction>,
         event: MotionEvent
     ): Boolean {
+        // Pen on the ruler's grip slides the ruler instead of drawing.
+        if (handleRulerGrip(event)) return true
         // Sensor → handler delta is computed against the ms-resolution
         // event.eventTime (same epoch as SystemClock.uptimeMillis).
         // recvNs is the System.nanoTime() at this dispatch and is used
@@ -1862,6 +1896,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 val xyp = floatArrayOf(
                     tmpDoc[0], tmpDoc[1], mapPressure(event.pressure)
                 )
+                // Ruler / compass: pick the guide (and ruler side) from
+                // the raw pen-down point, then constrain. Every later
+                // sample of the stroke, predicted ones included, goes
+                // through the same constraint.
+                guides.beginStroke(tmpDoc[0], tmpDoc[1])
+                guides.constrain(xyp, 1)
                 r.renderFrontBufferedLayer(
                     StrokeAction.BatchSamples(
                         xyp, realCount = 1, isNewStroke = true,
@@ -1922,6 +1962,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     }
                 }
 
+                // Real samples advance the ruler's contact state; the
+                // predicted tail is solved from a copy of it.
+                guides.constrain(xyp, realN, realN + predN)
                 r.renderFrontBufferedLayer(
                     StrokeAction.BatchSamples(
                         xyp, realCount = realN, isNewStroke = false,
@@ -1931,6 +1974,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 )
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                guides.endStroke()
                 r.commit()
             }
         }
@@ -1958,8 +2002,8 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     /** Snap the LINE-tool endpoint's *direction* from p0 to a multiple
-     *  of 15°, preserving distance from p0. Returns (x, y, stepIdx)
-     *  where stepIdx is the integer multiple of 15° that was selected
+     *  of angleSnapStepDeg, preserving distance from p0. Returns (x, y, stepIdx)
+     *  where stepIdx is the integer multiple of the step that was selected
      *  — caller uses it to display the exact snapped angle without
      *  going through an atan2(cos, sin) round-trip that can shave a
      *  degree off due to float precision. stepIdx == Int.MIN_VALUE
@@ -1971,7 +2015,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         val dy = p1y - p0y
         val dist = kotlin.math.sqrt(dx * dx + dy * dy)
         if (dist < 1.0f) return AngleSnapResult(p1x, p1y, Int.MIN_VALUE)
-        val step = kotlin.math.PI.toFloat() / 12f          // 15°
+        val step = Math.toRadians(angleSnapStepDeg.toDouble()).toFloat()
         val ang  = kotlin.math.atan2(dy, dx)
         val k    = kotlin.math.round(ang / step).toInt()
         val snappedAng = k * step
@@ -2086,12 +2130,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     val r = applyAngleSnap(shapeP0X, shapeP0Y, sx, sy)
                     shapeP1X = r.x; shapeP1Y = r.y
                     if (r.stepIdx != Int.MIN_VALUE) {
-                        // 15° increments. Convert from doc-coord
-                        // convention (y down, so a positive stepIdx
-                        // means clockwise from +x) to display
-                        // convention (90°=up). dispDeg = -k * 15
+                        // angleSnapStepDeg increments. Convert from
+                        // doc-coord convention (y down, so a positive
+                        // stepIdx means clockwise from +x) to display
+                        // convention (90°=up). dispDeg = -k * step
                         // wrapped into [0, 360).
-                        var deg = (-r.stepIdx * 15) % 360
+                        var deg = (-r.stepIdx * angleSnapStepDeg) % 360
                         if (deg < 0) deg += 360
                         onLineAngleChanged?.invoke(deg.toFloat())
                     }
@@ -2124,6 +2168,434 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
         }
         return true
+    }
+
+    // ---- Drafting guides (ruler / compass) ----------------------------
+    //
+    // The model and the stroke constraint live in Guides.kt; this is the
+    // RULER / COMPASS tool gesture that positions them. MainActivity owns
+    // the Guides instance (it persists it per document) and hands it in.
+
+    /** Shared with MainActivity, which loads / saves it per document. */
+    var guides: Guides = Guides()
+
+    /** A guide moved or was shown / hidden. `final` is false while a
+     *  drag is in progress (redraw + status readout only) and true when
+     *  it ends (also persist). */
+    var onGuidesChanged: ((final: Boolean) -> Unit)? = null
+
+    private enum class GuideDrag {
+        NONE, RULER_NEW, RULER_END0, RULER_END1, RULER_BODY,
+        COMPASS_NEW, COMPASS_CENTER, COMPASS_RADIUS
+    }
+    private var guideDrag = GuideDrag.NONE
+    /** Live guide drag in progress (status bar shows a readout). */
+    val isGuideDragActive: Boolean get() = guideDrag != GuideDrag.NONE
+    // Pen-down point (doc-px, raw and snapped) and view-px for the slop.
+    private var gDownX = 0f; private var gDownY = 0f
+    private var gDownSnapX = 0f; private var gDownSnapY = 0f
+    private var gDownViewX = 0f; private var gDownViewY = 0f
+    private var gMoved = false
+    // Latest pen position (doc-px), so a snap toggle mid-drag can re-solve
+    // the drag without waiting for the pen to move.
+    private var gLastX = 0f; private var gLastY = 0f
+    // Geometry at pen-down: ruler p0/p1 or compass centre / handle.
+    private var gOrigAx = 0f; private var gOrigAy = 0f
+    private var gOrigBx = 0f; private var gOrigBy = 0f
+    private val gTmp = FloatArray(6)
+    private val gView = FloatArray(2)
+    private val gSnap = FloatArray(3)
+
+    private val guideHitViewPx: Float
+        get() = kGuideHitDp * resources.displayMetrics.density
+
+    /** View-px distance between a doc point and a view point. */
+    private fun viewDist(dx: Float, dy: Float, vx: Float, vy: Float): Float {
+        docToView(dx, dy, gView)
+        return hypot(gView[0] - vx, gView[1] - vy)
+    }
+
+    /** Point-snap a doc point; returns true and fills gSnap[0..1] when it
+     *  locked onto a target (shape vertex / centre, grid crossing). */
+    private fun snapGuidePoint(x: Float, y: Float): Boolean {
+        NativeRenderer.snapPoint(x, y, gSnap)
+        if (gSnap[2] > 0.5f) return true
+        gSnap[0] = x; gSnap[1] = y
+        return false
+    }
+
+    private fun handleGuideEvent(event: MotionEvent): Boolean {
+        viewToDoc(event.x, event.y, tmpDoc)
+        val px = tmpDoc[0]
+        val py = tmpDoc[1]
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                gDownX = px; gDownY = py
+                gLastX = px; gLastY = py
+                gDownViewX = event.x; gDownViewY = event.y
+                gMoved = false
+                snapGuidePoint(px, py)
+                gDownSnapX = gSnap[0]; gDownSnapY = gSnap[1]
+                guideDrag = if (currentTool == Tool.RULER) pickRulerDrag(event)
+                            else pickCompassDrag(event)
+                lastDraggedGuide = currentTool
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (guideDrag == GuideDrag.NONE) return true
+                gLastX = px; gLastY = py
+                if (!gMoved) {
+                    val dvx = event.x - gDownViewX
+                    val dvy = event.y - gDownViewY
+                    if (dvx * dvx + dvy * dvy < kGuideSlopViewPx * kGuideSlopViewPx) {
+                        return true
+                    }
+                    gMoved = true
+                }
+                updateGuideDrag(px, py)
+                onGuidesChanged?.invoke(false)
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> endGuideDrag()
+        }
+        return true
+    }
+
+    private fun pickRulerDrag(event: MotionEvent): GuideDrag {
+        val r = guides.ruler
+        if (r.visible && r.length >= 1f) {
+            val hit = guideHitViewPx
+            val d0 = viewDist(r.x0, r.y0, event.x, event.y)
+            val d1 = viewDist(r.x1, r.y1, event.x, event.y)
+            if (d0 <= hit || d1 <= hit) {
+                gOrigAx = r.x0; gOrigAy = r.y0; gOrigBx = r.x1; gOrigBy = r.y1
+                return if (d0 <= d1) GuideDrag.RULER_END0 else GuideDrag.RULER_END1
+            }
+            if (r.local(gDownX, gDownY, gTmp)
+                && gTmp[0] in 0f..r.length && gTmp[1] in 0f..r.width) {
+                gOrigAx = r.x0; gOrigAy = r.y0; gOrigBx = r.x1; gOrigBy = r.y1
+                return GuideDrag.RULER_BODY
+            }
+        }
+        // Empty canvas: a drag lays down a new ruler along the drag.
+        return GuideDrag.RULER_NEW
+    }
+
+    private fun pickCompassDrag(event: MotionEvent): GuideDrag {
+        val c = guides.compass
+        if (c.visible && c.radius >= 1f) {
+            val hit = guideHitViewPx
+            val dc = viewDist(c.cx, c.cy, event.x, event.y)
+            val dh = viewDist(c.handleX, c.handleY, event.x, event.y)
+            gOrigAx = c.cx; gOrigAy = c.cy
+            gOrigBx = c.handleX; gOrigBy = c.handleY
+            // Knob before centre: on a tiny circle they overlap, and
+            // the knob is the one you can't reach any other way.
+            if (dh <= hit && dh <= dc) return GuideDrag.COMPASS_RADIUS
+            if (dc <= hit) return GuideDrag.COMPASS_CENTER
+            // Anywhere on the ring also resizes, and moves the knob there.
+            val ringViewPx = c.distanceTo(gDownX, gDownY) * viewScale
+            if (ringViewPx <= hit) {
+                gOrigBx = gDownX; gOrigBy = gDownY
+                return GuideDrag.COMPASS_RADIUS
+            }
+        }
+        return GuideDrag.COMPASS_NEW
+    }
+
+    private fun updateGuideDrag(px: Float, py: Float) {
+        val r = guides.ruler
+        val c = guides.compass
+        // Pen travel since DOWN; handle drags apply it to the handle's
+        // original position so the grab point doesn't jump.
+        val ddx = px - gDownX
+        val ddy = py - gDownY
+        when (guideDrag) {
+            GuideDrag.RULER_NEW, GuideDrag.RULER_END0, GuideDrag.RULER_END1 -> {
+                val fixedX: Float; val fixedY: Float
+                val tx: Float; val ty: Float
+                when (guideDrag) {
+                    GuideDrag.RULER_NEW  -> { fixedX = gDownSnapX; fixedY = gDownSnapY
+                                              tx = px; ty = py }
+                    GuideDrag.RULER_END0 -> { fixedX = gOrigBx; fixedY = gOrigBy
+                                              tx = gOrigAx + ddx; ty = gOrigAy + ddy }
+                    else                 -> { fixedX = gOrigAx; fixedY = gOrigAy
+                                              tx = gOrigBx + ddx; ty = gOrigBy + ddy }
+                }
+                // Point snap wins over angle snap, as with the line tool.
+                var mx: Float; var my: Float
+                if (snapGuidePoint(tx, ty)) {
+                    mx = gSnap[0]; my = gSnap[1]
+                } else if (angleSnapEnabled) {
+                    val a = applyAngleSnap(fixedX, fixedY, tx, ty)
+                    mx = a.x; my = a.y
+                } else {
+                    mx = tx; my = ty
+                }
+                if (hypot(mx - fixedX, my - fixedY) < 1f) return
+                if (guideDrag == GuideDrag.RULER_END0) {
+                    r.x0 = mx; r.y0 = my; r.x1 = fixedX; r.y1 = fixedY
+                } else {
+                    r.x0 = fixedX; r.y0 = fixedY; r.x1 = mx; r.y1 = my
+                }
+                r.visible = true
+            }
+            GuideDrag.RULER_BODY -> {
+                var ox = ddx; var oy = ddy
+                // Snap whichever end lands on a target first.
+                if (snapGuidePoint(gOrigAx + ox, gOrigAy + oy)) {
+                    ox = gSnap[0] - gOrigAx; oy = gSnap[1] - gOrigAy
+                } else if (snapGuidePoint(gOrigBx + ox, gOrigBy + oy)) {
+                    ox = gSnap[0] - gOrigBx; oy = gSnap[1] - gOrigBy
+                }
+                r.x0 = gOrigAx + ox; r.y0 = gOrigAy + oy
+                r.x1 = gOrigBx + ox; r.y1 = gOrigBy + oy
+            }
+            GuideDrag.COMPASS_NEW -> {
+                snapGuidePoint(px, py)
+                val rad = hypot(gSnap[0] - gDownSnapX, gSnap[1] - gDownSnapY)
+                if (rad < 1f) return
+                c.cx = gDownSnapX; c.cy = gDownSnapY
+                c.radius = rad
+                c.handleAngle = atan2(gSnap[1] - gDownSnapY, gSnap[0] - gDownSnapX)
+                c.visible = true
+            }
+            GuideDrag.COMPASS_CENTER -> {
+                snapGuidePoint(gOrigAx + ddx, gOrigAy + ddy)
+                c.cx = gSnap[0]; c.cy = gSnap[1]
+            }
+            GuideDrag.COMPASS_RADIUS -> {
+                snapGuidePoint(gOrigBx + ddx, gOrigBy + ddy)
+                val rad = hypot(gSnap[0] - c.cx, gSnap[1] - c.cy)
+                if (rad < 1f) return
+                c.radius = rad
+                c.handleAngle = atan2(gSnap[1] - c.cy, gSnap[0] - c.cx)
+            }
+            GuideDrag.NONE -> {}
+        }
+    }
+
+    /** Point or angle snap was toggled (stylus button or status chip):
+     *  re-solve an in-progress guide drag at the current pen position so
+     *  the change shows immediately, not on the next pen movement. */
+    fun refreshGuideDrag() {
+        if (guideDrag == GuideDrag.NONE || !gMoved) return
+        updateGuideDrag(gLastX, gLastY)
+        onGuidesChanged?.invoke(false)
+    }
+
+    private fun endGuideDrag() {
+        if (guideDrag == GuideDrag.NONE) return
+        guideDrag = GuideDrag.NONE
+        onGuidesChanged?.invoke(true)
+    }
+
+    /** Rail tile for RULER / COMPASS. Not the current tool: switch to
+     *  it and make sure its guide is showing (placing a default one, or
+     *  bringing an off-screen one back into view). Already the current
+     *  tool: show / hide the guide. */
+    fun onGuideToolTapped(tool: Tool) {
+        if (tool != Tool.RULER && tool != Tool.COMPASS) return
+        val isRuler = tool == Tool.RULER
+        if (currentTool == tool) {
+            if (isRuler) guides.ruler.visible = !guides.ruler.visible
+            else guides.compass.visible = !guides.compass.visible
+            if ((isRuler && guides.ruler.visible) || (!isRuler && guides.compass.visible)) {
+                placeGuideInView(isRuler)
+            }
+        } else {
+            setTool(tool)
+            if (isRuler) guides.ruler.visible = true else guides.compass.visible = true
+            placeGuideInView(isRuler)
+        }
+        onGuidesChanged?.invoke(true)
+    }
+
+    /** A just-shown guide that's degenerate (never placed) gets a default
+     *  one in the middle of the visible canvas; one whose centre is
+     *  off-screen is moved there, keeping its angle / length / radius. */
+    private fun placeGuideInView(isRuler: Boolean) {
+        val (cx, cy) = viewCenterDoc()
+        val visW = (width - visibleLeftInset).coerceAtLeast(1) / viewScale
+        val visH = height.coerceAtLeast(1) / viewScale
+        if (isRuler) {
+            val r = guides.ruler
+            if (r.length < 1f) {
+                // Horizontal on screen, 60% of the visible width.
+                val half = visW * 0.3f
+                val ux = cos(-viewRotation); val uy = sin(-viewRotation)
+                r.x0 = cx - ux * half; r.y0 = cy - uy * half
+                r.x1 = cx + ux * half; r.y1 = cy + uy * half
+                r.width = RulerGuide.kDefaultWidthDoc
+            } else {
+                val mx = (r.x0 + r.x1) * 0.5f
+                val my = (r.y0 + r.y1) * 0.5f
+                if (!docPointOnScreen(mx, my)) {
+                    val ox = cx - mx; val oy = cy - my
+                    r.x0 += ox; r.y0 += oy; r.x1 += ox; r.y1 += oy
+                }
+            }
+        } else {
+            val c = guides.compass
+            if (c.radius < 1f) {
+                c.cx = cx; c.cy = cy
+                c.radius = minOf(visW, visH) * 0.2f
+                c.handleAngle = -viewRotation
+            } else if (!docPointOnScreen(c.cx, c.cy)) {
+                c.cx = cx; c.cy = cy
+            }
+        }
+    }
+
+    private fun docPointOnScreen(x: Float, y: Float): Boolean {
+        docToView(x, y, gView)
+        return gView[0] >= visibleLeftInset && gView[0] <= width
+            && gView[1] >= 0f && gView[1] <= height
+    }
+
+    // ---- Ruler grip (pen) -----------------------------------------------
+    //
+    // A handle on the ruler body, shown while a raster stroke tool is
+    // active: pen-down on it and drag slides the ruler with its angle
+    // fixed; with point snap on, the sideways part steps by the grid
+    // pitch (even hatching: stroke, drag the grip, stroke). Pen-down
+    // anywhere else draws as usual. The grip is the only way to move the
+    // ruler without leaving the drawing tool — finger dragging is out,
+    // because the MovinkPad drops ALL touch while a palm rests on the
+    // glass, so a second hand can't reach the ruler mid-drawing.
+    //
+    // It sits on the ruler's centre line, midway along the part that's
+    // on screen, so it stays reachable when zoomed in on a long ruler;
+    // during a drag it's pinned to the ruler at the grab point instead,
+    // so it stays under the pen.
+
+    /** Grid pitch (doc-px), the hatch step. Mirrored by MainActivity. */
+    var gridSpacingDoc: Float = 20f
+    /** Point-snap toggle, mirrored by MainActivity (native holds the
+     *  real flag; this view only needs it for the hatch step). */
+    var pointSnapEnabled: Boolean = true
+
+    /** Guide most recently moved by a drag, for the status readout:
+     *  Tool.RULER, Tool.COMPASS or null. */
+    var lastDraggedGuide: Tool? = null
+        private set
+
+    private var gripDragging = false
+    // Ruler-local t of the grip while dragging (NaN = not pinned).
+    private var gripPinnedT = Float.NaN
+    private var gripDownX = 0f; private var gripDownY = 0f
+    private var gripR0x0 = 0f; private var gripR0y0 = 0f
+    private var gripR0x1 = 0f; private var gripR0y1 = 0f
+    private val gripTmp = FloatArray(6)
+    private val gripA = FloatArray(2)
+    private val gripB = FloatArray(2)
+
+    /** Whether the grip shows / grabs for the current tool. */
+    val rulerGripActive: Boolean
+        get() = currentTool.isRasterStroke && guides.ruler.visible
+                && guides.ruler.length >= 1f
+
+    /** Grip centre (doc-px) into out[0..1]; false when there's no grip
+     *  (tool, hidden ruler, or no part of it on screen). */
+    fun rulerGripDoc(out: FloatArray): Boolean {
+        if (!rulerGripActive) return false
+        val r = guides.ruler
+        val len = r.length
+        val ux = (r.x1 - r.x0) / len; val uy = (r.y1 - r.y0) / len
+        val nx = -uy; val ny = ux
+        val cx0 = r.x0 + nx * r.width * 0.5f
+        val cy0 = r.y0 + ny * r.width * 0.5f
+        val t: Float
+        if (!gripPinnedT.isNaN()) {
+            t = gripPinnedT
+        } else {
+            // Clip the centre line to the visible canvas (inset by the
+            // grip's own size) and take the middle of what's left. The
+            // doc→view map is affine, so clipping in view space and
+            // reading the parameter back is exact.
+            docToView(cx0, cy0, gripA)
+            docToView(cx0 + ux * len, cy0 + uy * len, gripB)
+            val m = GuideOverlayView.kGripDrawDp * resources.displayMetrics.density
+            val dx = gripB[0] - gripA[0]; val dy = gripB[1] - gripA[1]
+            var u0 = 0f; var u1 = 1f
+            fun clip(p: Float, q: Float): Boolean {
+                if (p == 0f) return q >= 0f
+                val rr = q / p
+                if (p < 0f) { if (rr > u1) return false; if (rr > u0) u0 = rr }
+                else        { if (rr < u0) return false; if (rr < u1) u1 = rr }
+                return true
+            }
+            if (!clip(-dx, gripA[0] - (visibleLeftInset + m))) return false
+            if (!clip(dx, (width - m) - gripA[0])) return false
+            if (!clip(-dy, gripA[1] - m)) return false
+            if (!clip(dy, (height - m) - gripA[1])) return false
+            if (u0 > u1) return false
+            t = len * (u0 + u1) * 0.5f
+        }
+        out[0] = cx0 + ux * t
+        out[1] = cy0 + uy * t
+        return true
+    }
+
+    /** Pen events for a raster stroke tool, before the stroke path.
+     *  True = the grip took this event. */
+    private fun handleRulerGrip(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                if (event.getToolType(0) != MotionEvent.TOOL_TYPE_STYLUS) return false
+                if (!rulerGripDoc(gripTmp)) return false
+                val gx = gripTmp[0]; val gy = gripTmp[1]
+                val hit = GuideOverlayView.kGripHitDp * resources.displayMetrics.density
+                if (viewDist(gx, gy, event.x, event.y) > hit) return false
+                val r = guides.ruler
+                if (!r.local(gx, gy, gripTmp)) return false
+                gripPinnedT = gripTmp[0]
+                viewToDoc(event.x, event.y, tmpDoc)
+                gripDownX = tmpDoc[0]; gripDownY = tmpDoc[1]
+                gripR0x0 = r.x0; gripR0y0 = r.y0; gripR0x1 = r.x1; gripR0y1 = r.y1
+                gripDragging = true
+                lastDraggedGuide = Tool.RULER
+                onGuidesChanged?.invoke(false)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!gripDragging) return false
+                viewToDoc(event.x, event.y, tmpDoc)
+                slideRuler(tmpDoc[0] - gripDownX, tmpDoc[1] - gripDownY)
+                onGuidesChanged?.invoke(false)
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                if (!gripDragging) return false
+                endGripDrag()
+                return true
+            }
+        }
+        return gripDragging
+    }
+
+    /** Move the ruler by pen travel (dx, dy) from the grab, angle fixed;
+     *  with point snap on, the sideways part snaps to whole grid steps
+     *  so successive hatch lines come out evenly spaced. */
+    private fun slideRuler(dx: Float, dy: Float) {
+        val len = hypot(gripR0x1 - gripR0x0, gripR0y1 - gripR0y0)
+        if (len < 1e-3f) return
+        val ux = (gripR0x1 - gripR0x0) / len; val uy = (gripR0y1 - gripR0y0) / len
+        val nx = -uy; val ny = ux
+        val along = dx * ux + dy * uy
+        var side = dx * nx + dy * ny
+        val step = gridSpacingDoc
+        if (pointSnapEnabled && step >= 1f) side = kotlin.math.round(side / step) * step
+        val ox = ux * along + nx * side
+        val oy = uy * along + ny * side
+        val r = guides.ruler
+        r.x0 = gripR0x0 + ox; r.y0 = gripR0y0 + oy
+        r.x1 = gripR0x1 + ox; r.y1 = gripR0y1 + oy
+    }
+
+    private fun endGripDrag() {
+        if (!gripDragging) return
+        gripDragging = false
+        gripPinnedT = Float.NaN
+        onGuidesChanged?.invoke(true)
     }
 
     private var pageBoundsInitialized = false

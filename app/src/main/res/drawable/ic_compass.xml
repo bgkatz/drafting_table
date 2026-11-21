@@ -1,0 +1,15 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp" android:height="24dp"
+    android:viewportWidth="24" android:viewportHeight="24">
+    <!-- Drafting compass: hinge on top, pivot leg and pen leg, and the
+         arc the pen leg sweeps. -->
+    <path android:strokeColor="#000" android:strokeWidth="1.5"
+          android:strokeLineCap="round" android:fillColor="#00000000"
+          android:pathData="M12,3 L12,5.2 M11.2,6.6 L6.5,20 M12.8,6.6 L17.5,20"/>
+    <path android:strokeColor="#000" android:strokeWidth="1.3"
+          android:fillColor="#00000000"
+          android:pathData="M12,4.6 m-1.4,0 a1.4,1.4 0 1,0 2.8,0 a1.4,1.4 0 1,0 -2.8,0 Z"/>
+    <path android:strokeColor="#000" android:strokeWidth="0.9"
+          android:strokeLineCap="round" android:fillColor="#00000000"
+          android:pathData="M4,17.5 Q12,23.5 20,17.5"/>
+</vector>

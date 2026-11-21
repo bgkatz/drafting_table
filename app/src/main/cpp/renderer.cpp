@@ -1401,6 +1401,10 @@ std::atomic<int> g_snapEnabled{1};
 // of DrawingSurfaceView.angleSnapEnabled. When on, rotations and line
 // draws lock to 15° increments.
 std::atomic<int> g_angleSnapEnabled{0};
+// Angle-snap step in radians (status-bar angle chip long-press slider,
+// whole degrees 1..90). Default 15°. Read by every angle snap: line
+// endpoint drags, shape rotation, raster-selection rotation.
+std::atomic<float> g_angleSnapStepRad{3.14159265358979323846f / 12.0f};
 // SELECT panel "keep aspect" toggle. When on, corner-handle scale drags
 // of a raster selection, Rect, or Ellipse scale both axes uniformly.
 std::atomic<int> g_preserveAspectEnabled{0};
@@ -12298,8 +12302,10 @@ void applyRasterRotateTo(float x, float y) {
     float newRotation = d.initialRotation + delta;
 
     if (g_snapEnabled.load() != 0) {
-        constexpr float kStep = 3.14159265358979323846f / 12.0f;  // 15 deg
-        constexpr float kTol  = 5.0f * 3.14159265358979323846f / 180.0f;
+        const float kStep = g_angleSnapStepRad.load();
+        // Soft snap: within 5° of a step, or half a step if that's less.
+        const float kTol  = std::min(5.0f * 3.14159265358979323846f / 180.0f,
+                                     kStep * 0.5f);
         float k = std::round(newRotation / kStep);
         float snapped = k * kStep;
         if (std::fabs(newRotation - snapped) <= kTol) {
@@ -12726,7 +12732,7 @@ void applyScaleTo(float x, float y) {
         float dy = y - d.anchorY;
         float dist = std::sqrt(dx * dx + dy * dy);
         if (dist >= 1.0f) {
-            constexpr float kStep = 3.14159265358979323846f / 12.0f; // 15°
+            const float kStep = g_angleSnapStepRad.load();
             float ang        = std::atan2(dy, dx);
             float snappedAng = std::round(ang / kStep) * kStep;
             x = d.anchorX + std::cos(snappedAng) * dist;
@@ -12861,7 +12867,7 @@ void applyRotateTo(float x, float y) {
     // here; angle snap subsumes that — the user can flip it on for the
     // duration of the drag.
     if (g_angleSnapEnabled.load() != 0) {
-        constexpr float kStep = 3.14159265358979323846f / 12.0f;  // 15°
+        const float kStep = g_angleSnapStepRad.load();
         float k = std::round(newRotation / kStep);
         float snapped = k * kStep;
         // Re-derive delta so Line endpoints (which compute from
@@ -13288,12 +13294,23 @@ Java_com_bk_drawing_NativeRenderer_setSnapEnabled(
 }
 
 // Mirror of DrawingSurfaceView.angleSnapEnabled. When on, applyRotateTo
-// locks rotation to 15° increments and applyScaleTo on a Line locks
-// the dragged endpoint's direction from the anchor to 15° increments.
+// locks rotation to g_angleSnapStepRad increments and applyScaleTo on a
+// Line locks the dragged endpoint's direction from the anchor to the
+// same increments.
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_setAngleSnapEnabled(
         JNIEnv*, jobject, jboolean enabled) {
     g_angleSnapEnabled.store(enabled == JNI_TRUE ? 1 : 0);
+}
+
+// Angle-snap step in degrees (clamped to 1..90). Mirror of
+// DrawingSurfaceView.angleSnapStepDeg.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_setAngleSnapStep(
+        JNIEnv*, jobject, jfloat degrees) {
+    float d = std::isfinite(degrees) ? degrees : 15.0f;
+    d = std::max(1.0f, std::min(90.0f, d));
+    g_angleSnapStepRad.store(d * 3.14159265358979323846f / 180.0f);
 }
 
 // SELECT panel "keep aspect" toggle — see g_preserveAspectEnabled.
