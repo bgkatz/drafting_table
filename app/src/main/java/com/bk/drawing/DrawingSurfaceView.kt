@@ -1148,9 +1148,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
         return false
     }
 
-    private fun beginGesture(event: MotionEvent, p1Index: Int, p2Index: Int) {
-        // Cancel any in-progress draw / interaction so the user's drag
-        // doesn't bleed into a stroke or transform on gesture release.
+    /** Cancel any in-progress draw / interaction of the current tool, so
+     *  a gesture that takes over the pointer stream (2-finger view
+     *  gesture, finger grabbing a guide) doesn't bleed into it. */
+    private fun cancelInFlightToolAction() {
         when (currentTool) {
             Tool.BRUSH, Tool.ERASER, Tool.SHADE -> {
                 NativeRenderer.discardStroke()
@@ -1203,6 +1204,10 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 selRectMode = SelRectMode.NONE
             }
         }
+    }
+
+    private fun beginGesture(event: MotionEvent, p1Index: Int, p2Index: Int) {
+        cancelInFlightToolAction()
         gestureP1Id = event.getPointerId(p1Index)
         gestureP2Id = event.getPointerId(p2Index)
         viewToDoc(event.getX(p1Index), event.getY(p1Index), tmpDoc)
@@ -2471,9 +2476,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
     // pointer by the FrameLayout, the pen included.) Without a finger on
     // a guide, nothing changes: the event goes straight to dispatchTouch.
     //
-    // A finger can only grab with the FIRST contact of a gesture, so one
-    // landing while the pen is already down (the drawing hand's palm)
-    // never moves a guide.
+    // A finger can grab as the first contact or join later (the drawing
+    // hand's palm is often already resting), but never while the pen is
+    // on the glass, and contacts that look like a palm never grab. Once
+    // grabbed, this view owns the gesture until its last pointer lifts:
+    // resting contacts are ignored, the finger can lift and re-grab
+    // between strokes, and the pen is always routed by its own id.
     //
     //   one finger on the ruler  → slide it, angle fixed; with point snap
     //                              on, the sideways part steps by the grid
@@ -2620,101 +2628,151 @@ class DrawingSurfaceView @JvmOverloads constructor(
         try { dispatchTouch(pe) } finally { pe.recycle() }
     }
 
-    /** Runs first for every touch event. True = consumed by the finger-
-     *  held guide (the pen, if any, already dispatched from here). */
+    /** True from a guide grab until every pointer of that gesture is up:
+     *  this view owns the stream, routing the pen through dispatchTouch
+     *  as a pen-only event and ignoring everything else (a resting palm).
+     *  Kept for the whole gesture, not just while a finger holds, because
+     *  with a palm down the pen isn't pointer 0 and the plain path would
+     *  read the palm as the pen. */
+    private var routingGuideStream = false
+
+    /** Can pointer `idx` of `event` take hold of a guide? A real finger
+     *  (not a palm-sized contact, not a palm tool type), with the pen not
+     *  on the glass, landing on a visible guide. */
+    private fun fingerGrabHit(event: MotionEvent, idx: Int, penDown: Boolean): FingerMode {
+        if (penDown || eyedropperPending) return FingerMode.NONE
+        if (event.getToolType(idx) != MotionEvent.TOOL_TYPE_FINGER) return FingerMode.NONE
+        if (fingerTouchTooBig(event, idx)) return FingerMode.NONE
+        return fingerHit(event.getX(idx), event.getY(idx))
+    }
+
+    private fun startFingerGrab(event: MotionEvent, idx: Int, hit: FingerMode) {
+        fingerMode = hit
+        finger1Id = event.getPointerId(idx)
+        finger2Id = -1
+        lastDraggedGuide = if (hit == FingerMode.RULER) Tool.RULER else Tool.COMPASS
+        saveFingerUndo()
+        beginFingerPhase(event)
+    }
+
+    /** Runs first for every touch event. True = consumed by the guide
+     *  routing (the pen, if any, already dispatched from here). */
     private fun routeFingerGuide(event: MotionEvent): Boolean {
         val action = event.actionMasked
-        if (fingerMode == FingerMode.NONE) {
-            if (action != MotionEvent.ACTION_DOWN) return false
-            if (event.getToolType(0) != MotionEvent.TOOL_TYPE_FINGER) return false
-            if (eyedropperPending || fingerTouchTooBig(event, 0)) return false
-            val hit = fingerHit(event.x, event.y)
-            if (hit == FingerMode.NONE) return false
-            fingerMode = hit
-            finger1Id = event.getPointerId(0)
-            finger2Id = -1
-            routedPenId = -1
-            lastDraggedGuide = if (hit == FingerMode.RULER) Tool.RULER else Tool.COMPASS
-            // Same bookkeeping a fresh gesture gets in dispatchTouch.
-            gestureActive = false
-            suppressTouches = false
-            saveFingerUndo()
-            beginFingerPhase(event)
-            return true
+        if (!routingGuideStream) {
+            when (action) {
+                MotionEvent.ACTION_DOWN -> {
+                    val hit = fingerGrabHit(event, 0, penDown = false)
+                    if (hit == FingerMode.NONE) return false
+                    // Same bookkeeping a fresh gesture gets in dispatchTouch.
+                    gestureActive = false
+                    suppressTouches = false
+                    routedPenId = -1
+                    routingGuideStream = true
+                    startFingerGrab(event, 0, hit)
+                    return true
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    // A finger joining a gesture that's already under way —
+                    // typically the drawing hand's palm resting first. Only
+                    // while nothing else owns the stream: no pen on the
+                    // glass, no 2-finger view gesture.
+                    if (gestureActive || anyStylusPointer(event)) return false
+                    val idx = event.actionIndex
+                    val hit = fingerGrabHit(event, idx, penDown = penInContact)
+                    if (hit == FingerMode.NONE) return false
+                    // With finger drawing allowed the earlier contact may
+                    // have started a stroke / drag; drop it. (In stylus-
+                    // only mode it was swallowed and there's nothing.)
+                    if (!stylusOnlyDrawing) cancelInFlightToolAction()
+                    suppressTouches = false
+                    routedPenId = -1
+                    routingGuideStream = true
+                    startFingerGrab(event, idx, hit)
+                    return true
+                }
+                else -> return false
+            }
         }
         when (action) {
             MotionEvent.ACTION_POINTER_DOWN -> {
                 val idx = event.actionIndex
                 val tt = event.getToolType(idx)
-                if (tt == MotionEvent.TOOL_TYPE_STYLUS && routedPenId < 0) {
-                    routedPenId = event.getPointerId(idx)
-                    routedPenDownTime = event.eventTime
-                    dispatchRoutedPen(event, MotionEvent.ACTION_DOWN)
-                } else if (tt == MotionEvent.TOOL_TYPE_FINGER
-                           && fingerMode == FingerMode.RULER && finger2Id < 0
-                           && routedPenId < 0 && !fingerTouchTooBig(event, idx)) {
+                if (tt == MotionEvent.TOOL_TYPE_STYLUS) {
+                    if (routedPenId < 0) {
+                        routedPenId = event.getPointerId(idx)
+                        routedPenDownTime = event.eventTime
+                        dispatchRoutedPen(event, MotionEvent.ACTION_DOWN)
+                    }
+                } else if (fingerMode == FingerMode.NONE) {
+                    // Re-grab: palm still resting, finger back on a guide
+                    // between strokes.
+                    val hit = fingerGrabHit(event, idx, penDown = routedPenId >= 0)
+                    if (hit != FingerMode.NONE) startFingerGrab(event, idx, hit)
+                } else if (fingerMode == FingerMode.RULER && finger2Id < 0
+                           && routedPenId < 0
+                           && tt == MotionEvent.TOOL_TYPE_FINGER
+                           && !fingerTouchTooBig(event, idx)) {
                     finger2Id = event.getPointerId(idx)
                     beginFingerPhase(event)
                 }
-                // Anything else (a third finger, a finger while the pen is
-                // down) is ignored.
+                // Anything else (a palm, a third finger, a finger while
+                // the pen is down) is ignored.
             }
             MotionEvent.ACTION_MOVE -> {
                 // A resting finger still produces MOVEs on every pen
                 // sample (one stream); only redraw the overlay when the
                 // guide actually moved, to keep View work off the stroke.
-                if (updateFingerGuide(event)) onGuidesChanged?.invoke(false)
+                if (fingerMode != FingerMode.NONE && updateFingerGuide(event)) {
+                    onGuidesChanged?.invoke(false)
+                }
                 if (routedPenId >= 0) dispatchRoutedPen(event, MotionEvent.ACTION_MOVE)
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 val upId = event.getPointerId(event.actionIndex)
                 val cancelled = (event.flags and MotionEvent.FLAG_CANCELED) != 0
-                when (upId) {
-                    routedPenId -> {
+                when {
+                    upId == routedPenId -> {
                         dispatchRoutedPen(event,
                             if (cancelled) MotionEvent.ACTION_CANCEL else MotionEvent.ACTION_UP)
                         routedPenId = -1
                     }
-                    finger2Id -> {
+                    fingerMode == FingerMode.NONE -> {}
+                    upId == finger2Id -> {
                         finger2Id = -1
                         if (cancelled) restoreFingerUndo()
                         beginFingerPhase(event)
                     }
-                    finger1Id -> {
+                    upId == finger1Id -> {
                         if (cancelled) restoreFingerUndo()
                         finger1Id = finger2Id
                         finger2Id = -1
                         if (finger1Id >= 0) beginFingerPhase(event)
-                        else releaseFingerGuide(event)
+                        else endFingerGuide(cancelled = false)
                     }
                 }
             }
             MotionEvent.ACTION_UP -> {
-                // Last pointer: a held finger (the pen leaves via
-                // POINTER_UP while a finger is down).
-                endFingerGuide(
-                    cancelled = (event.flags and MotionEvent.FLAG_CANCELED) != 0)
+                // Last pointer of the gesture: the pen, a holding finger,
+                // or a stray (palm).
+                val upId = event.getPointerId(0)
+                val cancelled = (event.flags and MotionEvent.FLAG_CANCELED) != 0
+                if (upId == routedPenId) {
+                    dispatchRoutedPen(event,
+                        if (cancelled) MotionEvent.ACTION_CANCEL else MotionEvent.ACTION_UP)
+                }
+                endFingerGuide(cancelled = cancelled && upId == finger1Id)
                 routedPenId = -1
+                routingGuideStream = false
             }
             MotionEvent.ACTION_CANCEL -> {
                 if (routedPenId >= 0) dispatchRoutedPen(event, MotionEvent.ACTION_CANCEL)
                 routedPenId = -1
                 endFingerGuide(cancelled = true)
+                routingGuideStream = false
             }
         }
         return true
-    }
-
-    /** The last holding finger lifted while other pointers remain. A pen
-     *  still drawing carries on through the normal path (its stroke was
-     *  begun by a synthesized DOWN, and its events now arrive as plain
-     *  single-pointer MOVE / UP). Stray fingers are swallowed until
-     *  they lift, like the tail of a two-finger gesture. */
-    private fun releaseFingerGuide(event: MotionEvent) {
-        val penStillDown = routedPenId >= 0
-        endFingerGuide(cancelled = false)
-        routedPenId = -1
-        if (!penStillDown && event.pointerCount > 1) suppressTouches = true
     }
 
     /** Apply the held fingers to the guide. True if it moved. */
