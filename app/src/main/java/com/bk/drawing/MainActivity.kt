@@ -3289,12 +3289,54 @@ class MainActivity : AppCompatActivity() {
             PaperMenuItem("Export…")                            { showExportDialog() },
             PaperMenuItem("Stylus only: ${if (stylusOnly) "on" else "off"}")
                                                                 { toggleStylusOnly() },
+            PaperMenuItem("Touch debug: ${if (touchDebugView != null) "on" else "off"}")
+                                                                { toggleTouchDebug() },
             PaperMenuItem("Delete selection")                   { userDeleteSelection() },
             PaperMenuItem("Rasterize selection to layer below") { userRasterizeSelectionBelow() },
             PaperMenuItem("Cut")                                { mirrorTextToSystemClipboard(); drawingView?.queueCutSelection() },
             PaperMenuItem("Copy")                               { mirrorTextToSystemClipboard(); drawingView?.queueCopySelection() },
             PaperMenuItem("Paste")                              { userPaste() },
         ))
+    }
+
+    // ---- Touch debug overlay -------------------------------------------
+    // Rolling on-screen log of what the canvas's touch events report
+    // (pointer tool types, contact sizes, cancel flags, guide-grab
+    // decisions), for diagnosing multi-touch on the device without adb.
+    // Session-only; not persisted.
+    private var touchDebugView: TextView? = null
+    private val touchDebugLines = ArrayDeque<String>()
+
+    private fun toggleTouchDebug() {
+        val v = drawingView ?: return
+        val existing = touchDebugView
+        if (existing != null) {
+            (existing.parent as? ViewGroup)?.removeView(existing)
+            touchDebugView = null
+            v.onTouchDebug = null
+            touchDebugLines.clear()
+            return
+        }
+        val container = v.parent as? FrameLayout ?: return
+        val tv = TextView(this).apply {
+            typeface = Typeface.MONOSPACE
+            textSize = 9f
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0xB0000000.toInt())
+            setPadding(8.dp, 6.dp, 8.dp, 6.dp)
+            isClickable = false
+            isFocusable = false
+            text = "touch debug — rest your palm, then try the ruler"
+        }
+        container.addView(tv, FrameLayout.LayoutParams(
+            520.dp, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.TOP or Gravity.END).apply { topMargin = 8.dp; rightMargin = 8.dp })
+        touchDebugView = tv
+        v.onTouchDebug = { line ->
+            touchDebugLines.addLast(line)
+            while (touchDebugLines.size > 18) touchDebugLines.removeFirst()
+            tv.text = touchDebugLines.joinToString("\n")
+        }
     }
 
     private fun userRasterizeSelectionBelow() {

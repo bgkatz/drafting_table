@@ -1102,6 +1102,12 @@ class DrawingSurfaceView @JvmOverloads constructor(
         // Push the hover position to any overlay (brush preview).
         // EXIT means the pen has lifted clear of the surface, so the
         // overlay should hide.
+        if (onTouchDebug != null) {
+            when (event.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER -> touchDebug("pen hover enter")
+                MotionEvent.ACTION_HOVER_EXIT  -> touchDebug("pen hover exit")
+            }
+        }
         when (event.actionMasked) {
             MotionEvent.ACTION_HOVER_ENTER,
             MotionEvent.ACTION_HOVER_MOVE -> {
@@ -1271,7 +1277,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
         /** Finger grab: extra reach around the ruler body (dp), and the
          *  contact size above which a touch is treated as a palm (dp). */
         const val kFingerSlopDp = 12f
-        const val kPalmTouchMajorDp = 28f
+        // ~14 mm. 28dp (~4.5 mm) rejected fingertips that landed while a
+        // palm was resting; a palm's contact is far larger than this.
+        const val kPalmTouchMajorDp = 90f
         // Limits on the gesture-driven view scale. The floor is the
         // smaller of kMinViewScale and (fit-to-screen × fraction) — see
         // minViewScale() — so a large page can always be zoomed out to
@@ -1291,10 +1299,57 @@ class DrawingSurfaceView @JvmOverloads constructor(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        if (onTouchDebug != null) logTouchEvent(event)
         // A finger on the ruler / compass holds it; while it does, the
         // pen is routed from in there. Otherwise this is a no-op.
         if (routeFingerGuide(event)) return true
         return dispatchTouch(event)
+    }
+
+    // ---- Touch debug log (overflow menu → Touch debug) -----------------
+    // Diagnostic for multi-touch questions that can't be answered without
+    // the device: what each pointer reports and why a guide grab was
+    // refused. Null = off; costs nothing then.
+
+    var onTouchDebug: ((String) -> Unit)? = null
+    private var lastMoveLogMs = 0L
+
+    private fun touchDebug(line: String) { onTouchDebug?.invoke(line) }
+
+    private fun logTouchEvent(e: MotionEvent) {
+        val a = e.actionMasked
+        if (a == MotionEvent.ACTION_MOVE) {
+            // Moves only as a 4 Hz summary, or the log is nothing else.
+            val now = SystemClock.uptimeMillis()
+            if (now - lastMoveLogMs < 250L) return
+            lastMoveLogMs = now
+        }
+        val name = when (a) {
+            MotionEvent.ACTION_DOWN -> "DOWN"
+            MotionEvent.ACTION_UP -> "UP"
+            MotionEvent.ACTION_MOVE -> "move"
+            MotionEvent.ACTION_CANCEL -> "CANCEL"
+            MotionEvent.ACTION_POINTER_DOWN -> "PTR_DOWN#${e.getPointerId(e.actionIndex)}"
+            MotionEvent.ACTION_POINTER_UP -> "PTR_UP#${e.getPointerId(e.actionIndex)}"
+            else -> "act$a"
+        }
+        val dens = resources.displayMetrics.density
+        val sb = StringBuilder(name)
+        if ((e.flags and MotionEvent.FLAG_CANCELED) != 0) sb.append(" [CANCELED]")
+        for (i in 0 until e.pointerCount) {
+            val tool = when (e.getToolType(i)) {
+                MotionEvent.TOOL_TYPE_FINGER -> "finger"
+                MotionEvent.TOOL_TYPE_STYLUS -> "pen"
+                MotionEvent.TOOL_TYPE_ERASER -> "eraser"
+                MotionEvent.TOOL_TYPE_MOUSE -> "mouse"
+                5 -> "PALM"
+                else -> "tool${e.getToolType(i)}"
+            }
+            sb.append("  #").append(e.getPointerId(i)).append(' ').append(tool)
+              .append(" ").append((e.getTouchMajor(i) / dens).toInt()).append("dp")
+        }
+        if (routingGuideStream) sb.append("  {holding ${fingerMode.name.lowercase()}}")
+        touchDebug(sb.toString())
     }
 
     /** The touch dispatch proper: gestures, palm gate, tool handlers.
@@ -2640,10 +2695,18 @@ class DrawingSurfaceView @JvmOverloads constructor(
      *  (not a palm-sized contact, not a palm tool type), with the pen not
      *  on the glass, landing on a visible guide. */
     private fun fingerGrabHit(event: MotionEvent, idx: Int, penDown: Boolean): FingerMode {
-        if (penDown || eyedropperPending) return FingerMode.NONE
-        if (event.getToolType(idx) != MotionEvent.TOOL_TYPE_FINGER) return FingerMode.NONE
-        if (fingerTouchTooBig(event, idx)) return FingerMode.NONE
-        return fingerHit(event.getX(idx), event.getY(idx))
+        val why = when {
+            penDown -> "pen down"
+            eyedropperPending -> "eyedropper"
+            event.getToolType(idx) != MotionEvent.TOOL_TYPE_FINGER -> "not a finger"
+            fingerTouchTooBig(event, idx) -> "too big (palm?)"
+            else -> null
+        }
+        if (why != null) { touchDebug("  grab refused: $why"); return FingerMode.NONE }
+        val hit = fingerHit(event.getX(idx), event.getY(idx))
+        touchDebug(if (hit == FingerMode.NONE) "  grab refused: not on a guide"
+                   else "  GRAB ${hit.name.lowercase()}")
+        return hit
     }
 
     private fun startFingerGrab(event: MotionEvent, idx: Int, hit: FingerMode) {
@@ -2677,7 +2740,11 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     // typically the drawing hand's palm resting first. Only
                     // while nothing else owns the stream: no pen on the
                     // glass, no 2-finger view gesture.
-                    if (gestureActive || anyStylusPointer(event)) return false
+                    if (gestureActive || anyStylusPointer(event)) {
+                        touchDebug("  grab refused: " +
+                            if (gestureActive) "view gesture running" else "pen in event")
+                        return false
+                    }
                     val idx = event.actionIndex
                     val hit = fingerGrabHit(event, idx, penDown = penInContact)
                     if (hit == FingerMode.NONE) return false
