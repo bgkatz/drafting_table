@@ -430,20 +430,22 @@ class GuideOverlayView(
         path.close()
         canvas.drawPath(path, bodyFill)
 
-        // Edges: A (working) heavier than B.
-        haloPaint.strokeWidth = 3.0f * density
-        edgePaint.strokeWidth = 1.2f * density
-        docToView(r.x0, r.y0, p); docToView(r.x1, r.y1, q)
-        canvas.drawLine(p[0], p[1], q[0], q[1], haloPaint)
-        canvas.drawLine(p[0], p[1], q[0], q[1], edgePaint)
+        // Edges: all four the same thin line, inset into the body by half
+        // its width so none of it lies over the drawing side. A stroke
+        // run along any edge is centred on it, so a line centred on the
+        // edge (or a halo) would cover half the stroke. The ticks are
+        // what mark edge A as the working edge.
         edgePaint.strokeWidth = 0.8f * density
-        docToView(r.x0 + nx * w, r.y0 + ny * w, p)
-        docToView(r.x1 + nx * w, r.y1 + ny * w, q)
-        canvas.drawLine(p[0], p[1], q[0], q[1], edgePaint)
-        docToView(r.x0, r.y0, p); docToView(r.x0 + nx * w, r.y0 + ny * w, q)
-        canvas.drawLine(p[0], p[1], q[0], q[1], edgePaint)
-        docToView(r.x1, r.y1, p); docToView(r.x1 + nx * w, r.y1 + ny * w, q)
-        canvas.drawLine(p[0], p[1], q[0], q[1], edgePaint)
+        val inset = edgePaint.strokeWidth * 0.5f / viewScale().coerceAtLeast(1e-3f)
+        // Edge A (inward = +n), edge B (inward = -n).
+        drawInsetEdge(canvas, r.x0, r.y0, r.x1, r.y1, nx * inset, ny * inset)
+        drawInsetEdge(canvas, r.x0 + nx * w, r.y0 + ny * w,
+                      r.x1 + nx * w, r.y1 + ny * w, -nx * inset, -ny * inset)
+        // Ends (inward = +u at p0, -u at p1).
+        drawInsetEdge(canvas, r.x0, r.y0, r.x0 + nx * w, r.y0 + ny * w,
+                      ux * inset, uy * inset)
+        drawInsetEdge(canvas, r.x1, r.y1, r.x1 + nx * w, r.y1 + ny * w,
+                      -ux * inset, -uy * inset)
 
         // Ticks along edge A, measured from p0, into the body. Pitch
         // coarsens as you zoom out so they never smear into a band.
@@ -470,6 +472,14 @@ class GuideOverlayView(
             drawHandle(canvas, r.x0, r.y0)
             drawHandle(canvas, r.x1, r.y1)
         }
+    }
+
+    /** Doc segment a→b shifted by doc offset (ox, oy) into the body. */
+    private fun drawInsetEdge(canvas: Canvas, ax: Float, ay: Float,
+                              bx: Float, by: Float, ox: Float, oy: Float) {
+        docToView(ax + ox, ay + oy, p)
+        docToView(bx + ox, by + oy, q)
+        canvas.drawLine(p[0], p[1], q[0], q[1], edgePaint)
     }
 
     private fun isMultiple(t: Float, m: Float): Boolean {
