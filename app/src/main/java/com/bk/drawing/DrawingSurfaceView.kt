@@ -878,11 +878,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
                        || currentTool == Tool.RECTANGLE
                        || currentTool == Tool.CIRCLE
                        || currentTool == Tool.ELLIPSE
-        if (activeIsVector || isShapeTool) {
+        // The guide tools position things like a shape tool does, so the
+        // middle button means angle snap for them too.
+        val isGuideTool = currentTool == Tool.RULER || currentTool == Tool.COMPASS
+        if (activeIsVector || isShapeTool || isGuideTool) {
             angleSnapEnabled = !angleSnapEnabled
             Log.i("DrawingApp",
                   "angle snap -> ${if (angleSnapEnabled) "on" else "off"}")
             onAngleSnapChanged?.invoke(angleSnapEnabled)
+            refreshGuideDrag()
             return
         }
         // Auto-commit any floating raster selection before swapping tools
@@ -1942,7 +1946,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
                     }
                 }
 
-                guides.constrain(xyp, realN + predN)
+                // Real samples advance the ruler's contact state; the
+                // predicted tail is solved from a copy of it.
+                guides.constrain(xyp, realN, realN + predN)
                 r.renderFrontBufferedLayer(
                     StrokeAction.BatchSamples(
                         xyp, realCount = realN, isNewStroke = false,
@@ -2174,6 +2180,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
     private var gDownSnapX = 0f; private var gDownSnapY = 0f
     private var gDownViewX = 0f; private var gDownViewY = 0f
     private var gMoved = false
+    // Latest pen position (doc-px), so a snap toggle mid-drag can re-solve
+    // the drag without waiting for the pen to move.
+    private var gLastX = 0f; private var gLastY = 0f
     // Geometry at pen-down: ruler p0/p1 or compass centre / handle.
     private var gOrigAx = 0f; private var gOrigAy = 0f
     private var gOrigBx = 0f; private var gOrigBy = 0f
@@ -2206,6 +2215,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 gDownX = px; gDownY = py
+                gLastX = px; gLastY = py
                 gDownViewX = event.x; gDownViewY = event.y
                 gMoved = false
                 snapGuidePoint(px, py)
@@ -2215,6 +2225,7 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
             MotionEvent.ACTION_MOVE -> {
                 if (guideDrag == GuideDrag.NONE) return true
+                gLastX = px; gLastY = py
                 if (!gMoved) {
                     val dvx = event.x - gDownViewX
                     val dvy = event.y - gDownViewY
@@ -2343,6 +2354,15 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
             GuideDrag.NONE -> {}
         }
+    }
+
+    /** Point or angle snap was toggled (stylus button or status chip):
+     *  re-solve an in-progress guide drag at the current pen position so
+     *  the change shows immediately, not on the next pen movement. */
+    fun refreshGuideDrag() {
+        if (guideDrag == GuideDrag.NONE || !gMoved) return
+        updateGuideDrag(gLastX, gLastY)
+        onGuidesChanged?.invoke(false)
     }
 
     private fun endGuideDrag() {

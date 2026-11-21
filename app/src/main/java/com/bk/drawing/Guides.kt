@@ -107,8 +107,17 @@ class Guides {
     // Chosen once per stroke at pen-down, then applied to every sample
     // (real and predicted) of that stroke. The per-stroke snapshot of the
     // geometry means a guide edit can't move a stroke mid-flight.
+    //
+    // The ruler is a solid rectangle the pen can't enter, from any side.
+    // It's solved as a sliding contact in ruler-local (t, s) coordinates:
+    // each sample moves the pen from where it last was towards the raw
+    // point; if that path enters the body, the pen stops on the face it
+    // hit and slides along it (the raw point projected onto that face).
+    // Pulling away, or rounding a corner, is free. That makes the edge a
+    // straight line to draw along, and an end a wall rather than a
+    // teleport onto the nearer long edge.
 
-    private enum class Mode { NONE, RULER_A, RULER_B, COMPASS }
+    private enum class Mode { NONE, RULER, COMPASS }
     private var mode = Mode.NONE
     // Snapshot of the active guide (ruler: origin, axes, length, width;
     // compass: centre, radius).
@@ -117,18 +126,24 @@ class Guides {
     private var snx = 0f; private var sny = 0f
     private var sLen = 0f; private var sWidth = 0f
     private var sR = 0f
-    // Last direction used for a compass sample that landed exactly on
-    // the centre (no direction of its own).
+    // Contact state, advanced by real samples only. Predicted samples
+    // run from a copy so the revert-and-replace of the predicted tail
+    // can't leave the solver somewhere the pen never really went.
+    // Ruler: pen position in local (t, s). Compass: last direction, for
+    // a sample that lands exactly on the centre.
+    private var penT = 0f; private var penS = 0f
     private var lastDirX = 1f; private var lastDirY = 0f
     private val tmp = FloatArray(6)
+    private val out2 = FloatArray(2)
+    private val lbP = FloatArray(4)
+    private val lbQ = FloatArray(4)
 
     val strokeConstrained: Boolean get() = mode != Mode.NONE
 
-    /** Pen-down at doc (x, y): pick the guide and, for the ruler, the
-     *  side whose edge the pen will slide along. A pen-down far from
-     *  both still gets constrained — a real ruler on the desk blocks a
-     *  stroke no matter where it started. When both guides are showing,
-     *  the nearer one wins. */
+    /** Pen-down at doc (x, y): pick the guide. A pen-down far from both
+     *  still gets constrained (a ruler on the desk blocks a stroke no
+     *  matter where it started); when both guides are showing, the
+     *  nearer one wins. */
     fun beginStroke(x: Float, y: Float) {
         mode = Mode.NONE
         val r = ruler
@@ -144,13 +159,18 @@ class Guides {
             sx0 = r.x0; sy0 = r.y0
             sux = tmp[2]; suy = tmp[3]; snx = tmp[4]; sny = tmp[5]
             sLen = r.length; sWidth = r.width
-            val s = tmp[1]
-            mode = when {
-                s <= 0f -> Mode.RULER_A
-                s >= sWidth -> Mode.RULER_B
-                // Pen-down on the body: slide along the nearer edge.
-                s < sWidth * 0.5f -> Mode.RULER_A
-                else -> Mode.RULER_B
+            mode = Mode.RULER
+            penT = tmp[0]; penS = tmp[1]
+            if (insideBody(penT, penS)) {
+                // Pen-down on the body: start on the nearest face.
+                val dA = penS; val dB = sWidth - penS
+                val d0 = penT; val d1 = sLen - penT
+                when (minOf(minOf(dA, dB), minOf(d0, d1))) {
+                    dA -> penS = 0f
+                    dB -> penS = sWidth
+                    d0 -> penT = 0f
+                    else -> penT = sLen
+                }
             }
         } else if (compassOk) {
             sx0 = c.cx; sy0 = c.cy; sR = c.radius
@@ -164,45 +184,120 @@ class Guides {
 
     fun endStroke() { mode = Mode.NONE }
 
-    /** Constrain `count` [x, y, p] triples of `xyp` in place. */
-    fun constrain(xyp: FloatArray, count: Int) {
-        when (mode) {
-            Mode.NONE -> return
-            Mode.COMPASS -> {
-                for (i in 0 until count) {
-                    val k = i * 3
-                    val dx = xyp[k] - sx0
-                    val dy = xyp[k + 1] - sy0
-                    val d = hypot(dx, dy)
-                    if (d > 1e-4f) { lastDirX = dx / d; lastDirY = dy / d }
-                    xyp[k]     = sx0 + lastDirX * sR
-                    xyp[k + 1] = sy0 + lastDirY * sR
-                }
+    /** Constrain the first `count` [x, y, p] triples of `xyp` in place.
+     *  The first `realCount` advance the contact state; the rest
+     *  (prediction) are solved from a copy of it. */
+    fun constrain(xyp: FloatArray, realCount: Int, count: Int = realCount) {
+        if (mode == Mode.NONE) return
+        val keepT = penT; val keepS = penS
+        val keepDx = lastDirX; val keepDy = lastDirY
+        var savedT = penT; var savedS = penS
+        var savedDx = lastDirX; var savedDy = lastDirY
+        for (i in 0 until count) {
+            if (i == realCount) {
+                // Real samples done: remember where they left the solver.
+                savedT = penT; savedS = penS; savedDx = lastDirX; savedDy = lastDirY
             }
-            Mode.RULER_A, Mode.RULER_B -> {
-                val sideA = mode == Mode.RULER_A
-                for (i in 0 until count) {
-                    val k = i * 3
-                    val dx = xyp[k] - sx0
-                    val dy = xyp[k + 1] - sy0
-                    val t = dx * sux + dy * suy
-                    // Past the ends there's no straight edge to push on.
-                    if (t < 0f || t > sLen) continue
-                    val s = dx * snx + dy * sny
-                    // Edge A is s = 0 with the free side s < 0; edge B is
-                    // s = width with the free side s > width. Anything on
-                    // the wrong side is pushed back onto the edge along
-                    // its normal, so sliding along it draws a straight
-                    // line and pulling away is free.
-                    val push = if (sideA) { if (s > 0f) -s else 0f }
-                               else { if (s < sWidth) sWidth - s else 0f }
-                    if (push != 0f) {
-                        xyp[k]     += push * snx
-                        xyp[k + 1] += push * sny
-                    }
-                }
+            val k = i * 3
+            if (mode == Mode.COMPASS) {
+                val dx = xyp[k] - sx0
+                val dy = xyp[k + 1] - sy0
+                val d = hypot(dx, dy)
+                if (d > 1e-4f) { lastDirX = dx / d; lastDirY = dy / d }
+                xyp[k]     = sx0 + lastDirX * sR
+                xyp[k + 1] = sy0 + lastDirY * sR
+            } else {
+                val dx = xyp[k] - sx0
+                val dy = xyp[k + 1] - sy0
+                stepRuler(dx * sux + dy * suy, dx * snx + dy * sny)
+                xyp[k]     = sx0 + penT * sux + penS * snx
+                xyp[k + 1] = sy0 + penT * suy + penS * sny
             }
         }
+        if (count > realCount) {
+            penT = savedT; penS = savedS; lastDirX = savedDx; lastDirY = savedDy
+        } else if (realCount == 0) {
+            penT = keepT; penS = keepS; lastDirX = keepDx; lastDirY = keepDy
+        }
+    }
+
+    private fun insideBody(t: Float, s: Float): Boolean =
+        t > kEps && t < sLen - kEps && s > kEps && s < sWidth - kEps
+
+    /** Move the pen from (penT, penS) towards raw (qt, qs). */
+    private fun stepRuler(qt: Float, qs: Float) {
+        val face = blockingFace(penT, penS, qt, qs)
+        if (face < 0) { penT = qt; penS = qs; return }
+        // Slide: the raw point projected onto the face it hit.
+        slideOnto(face, qt, qs, out2)
+        // Past the face's end (rounding a corner): if the rest of the way
+        // is clear, the pen gets there.
+        if (blockingFace(out2[0], out2[1], qt, qs) < 0) { penT = qt; penS = qs }
+        else { penT = out2[0]; penS = out2[1] }
+    }
+
+    private fun slideOnto(face: Int, qt: Float, qs: Float, out: FloatArray) {
+        when (face) {
+            kFaceT0 -> { out[0] = 0f;   out[1] = qs.coerceIn(0f, sWidth) }
+            kFaceT1 -> { out[0] = sLen; out[1] = qs.coerceIn(0f, sWidth) }
+            kFaceS0 -> { out[0] = qt.coerceIn(0f, sLen); out[1] = 0f }
+            else    -> { out[0] = qt.coerceIn(0f, sLen); out[1] = sWidth }
+        }
+    }
+
+    /** Liang-Barsky clip of the segment (pt, ps) to (qt, qs) against the
+     *  body [0, len] x [0, width]. Returns the face it enters through
+     *  when the segment passes through the body's interior (not merely
+     *  along a face or through a corner), else -1. */
+    private fun blockingFace(pt: Float, ps: Float, qt: Float, qs: Float): Int {
+        val dt = qt - pt
+        val ds = qs - ps
+        var u0 = 0f
+        var u1 = 1f
+        var face = -1
+        // Each constraint is p * u <= q. Reused scratch: this runs per pen
+        // sample, so no allocation here.
+        val ps4 = lbP; val qs4 = lbQ
+        ps4[0] = -dt; ps4[1] = dt; ps4[2] = -ds; ps4[3] = ds
+        qs4[0] = pt; qs4[1] = sLen - pt; qs4[2] = ps; qs4[3] = sWidth - ps
+        for (i in 0 until 4) {
+            val p = ps4[i]
+            val q = qs4[i]
+            if (p == 0f) {
+                if (q < 0f) return -1          // parallel and outside
+                continue
+            }
+            val r = q / p
+            if (p < 0f) {
+                if (r >= u0) { u0 = r; face = i }
+            } else if (r < u1) {
+                u1 = r
+            }
+            if (u0 > u1) return -1
+        }
+        if (u1 - u0 <= 1e-6f) return -1
+        // Grazing along a face or clipping a corner never enters the
+        // interior; test the middle of the clipped span.
+        val um = (u0 + u1) * 0.5f
+        if (!insideBody(pt + dt * um, ps + ds * um)) return -1
+        if (face < 0) {
+            // Started inside (can't normally happen): nearest face.
+            val dA = ps; val dB = sWidth - ps; val d0 = pt; val d1 = sLen - pt
+            face = when (minOf(minOf(dA, dB), minOf(d0, d1))) {
+                d0 -> kFaceT0; d1 -> kFaceT1; dA -> kFaceS0; else -> kFaceS1
+            }
+        }
+        return face
+    }
+
+    private companion object {
+        // Face ids match the Liang-Barsky constraint order:
+        // t >= 0, t <= len, s >= 0 (edge A), s <= width (edge B).
+        const val kFaceT0 = 0
+        const val kFaceT1 = 1
+        const val kFaceS0 = 2
+        const val kFaceS1 = 3
+        const val kEps = 1e-3f
     }
 
     // ---- Persistence -----------------------------------------------------

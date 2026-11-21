@@ -4168,6 +4168,7 @@ class MainActivity : AppCompatActivity() {
     private fun toggleSnap() {
         snapEnabled = !snapEnabled
         NativeRenderer.setSnapEnabled(snapEnabled)
+        drawingView?.refreshGuideDrag()
         if (::statusSnapText.isInitialized) {
             statusSnapText.text = if (snapEnabled) "snap: on" else "snap: off"
             statusSnapText.setTextColor(getColor(
@@ -4182,6 +4183,7 @@ class MainActivity : AppCompatActivity() {
         val v = drawingView ?: return
         v.angleSnapEnabled = !v.angleSnapEnabled
         refreshAngleSnapStatus()
+        v.refreshGuideDrag()
     }
 
     private fun refreshAngleSnapStatus() {
