@@ -1277,8 +1277,9 @@ class DrawingSurfaceView @JvmOverloads constructor(
         /** Finger grab: extra reach around the ruler body (dp), and the
          *  contact size above which a touch is treated as a palm (dp). */
         const val kFingerSlopDp = 12f
-        // ~14 mm. 28dp (~4.5 mm) rejected fingertips that landed while a
-        // palm was resting; a palm's contact is far larger than this.
+        // ~14 mm. Mostly moot on the MovinkPad, whose touch layer reports
+        // touchMajor of ~1-18dp for everything, palm included; kept as a
+        // guard for devices that do report contact size.
         const val kPalmTouchMajorDp = 90f
         // Limits on the gesture-driven view scale. The floor is the
         // smaller of kMinViewScale and (fit-to-screen × fraction) — see
@@ -2737,21 +2738,31 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 }
                 MotionEvent.ACTION_POINTER_DOWN -> {
                     // A finger joining a gesture that's already under way —
-                    // typically the drawing hand's palm resting first. Only
-                    // while nothing else owns the stream: no pen on the
-                    // glass, no 2-finger view gesture.
-                    if (gestureActive || anyStylusPointer(event)) {
-                        touchDebug("  grab refused: " +
-                            if (gestureActive) "view gesture running" else "pen in event")
+                    // typically the drawing hand resting first. Never while
+                    // the pen is on the glass.
+                    if (anyStylusPointer(event)) {
+                        touchDebug("  grab refused: pen in event")
                         return false
                     }
                     val idx = event.actionIndex
                     val hit = fingerGrabHit(event, idx, penDown = penInContact)
                     if (hit == FingerMode.NONE) return false
-                    // With finger drawing allowed the earlier contact may
-                    // have started a stroke / drag; drop it. (In stylus-
-                    // only mode it was swallowed and there's nothing.)
-                    if (!stylusOnlyDrawing) cancelInFlightToolAction()
+                    if (gestureActive) {
+                        // On the MovinkPad a resting palm reads as two or
+                        // more ordinary finger contacts (touchMajor is ~1dp
+                        // for everything, so size can't tell them apart),
+                        // which starts a 2-finger view gesture. A finger
+                        // landing on a guide wins: the view stays where the
+                        // gesture left it and the resting contacts are
+                        // ignored from here on.
+                        endGesture()
+                        touchDebug("  view gesture ended for grab")
+                    } else if (!stylusOnlyDrawing) {
+                        // With finger drawing allowed the earlier contact
+                        // may have started a stroke / drag; drop it. (In
+                        // stylus-only mode it was swallowed.)
+                        cancelInFlightToolAction()
+                    }
                     suppressTouches = false
                     routedPenId = -1
                     routingGuideStream = true
