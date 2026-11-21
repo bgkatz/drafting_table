@@ -113,6 +113,17 @@ Filling is `kPolyVS/FS` + a two-pass stencil (winding via `GL_INCR/DECR_WRAP` on
 - The fill (polygon + chord) is built from **real samples only** — `extendStrokeBatch` deliberately withholds the predicted tail from it while the dabs still get it. Prediction buys tip latency; the chord is a long edge anchored at the far end of the shape, so the predictor's overshoot just makes the bridge and its offset width shimmer, worse the larger the brush. It also keeps the preview's chord identical to the one the bake commits. Withholding it also steadies the offset, which is derived from those same samples and scales with brush size — a jittery reading makes the bridge's edge breathe, badly on a large brush.
 - Both chord passes measure **unsigned** distance to the chord segment. That's load-bearing: a signed/half-plane test would let the fade reach across a self-crossing scribble that legitimately spans the chord and gouge it, while an unsigned distance puts every far-off interior fragment deep in the solid range.
 
+### Drafting guides (ruler / compass)
+
+`Guides.kt` holds the model (`RulerGuide`, `CompassGuide`), the stroke constraint, and `GuideOverlayView`. **Pure Kotlin, no native involvement**: `handleStrokeEvent` calls `guides.beginStroke` on pen-down and `guides.constrain(xyp, n)` on every batch (real + predicted) *before* packing `BatchSamples`, so pressure, prediction, bake and undo are untouched. Applies to BRUSH / ERASER / SHADE only.
+
+- **Ruler**: p0→p1 is the working edge (edge A, ticked, the edge position snapping lines up); the body extends `width` doc-px to the left of p0→p1 (`n = (-u.y, u.x)`, y down) and its far side is edge B. The side is chosen at pen-down (on the body → nearer edge); samples on the wrong side are pushed back along the normal, free side untouched, no constraint past the ends.
+- **Compass**: every sample is projected radially onto the circle.
+- Both visible → the guide nearer the pen-down point wins.
+- `Tool.RULER` / `Tool.COMPASS` (native id -1) position them in `handleGuideEvent`: ruler end handles move that end (angle snap = existing `angleSnapEnabled`, point snap via `snapPoint` wins over angle), body drag moves, drag on empty canvas lays a new one; compass centre handle moves, knob or ring resizes, empty drag makes a new one. Re-tapping the active guide tile shows / hides it (`onGuideToolTapped`).
+- Persisted per **document** in `<docDir>/guides.txt` (not per page — page dirs are renumbered by queued native ops, so a Kotlin-side per-page file would race them).
+- The overlay is a plain non-clickable View above the SurfaceView, so guides never reach page pixels, thumbnails or exports. It must be invalidated on view-transform changes (`onViewTransformChanged`).
+
 ### Undo / redo
 
 Single global stack on the native side (`g_undoStack` / `g_redoStack`, `std::deque<UndoEntry>`, mutex-guarded). Bounded by **50 entries / 200 MB combined**; oldest entries evict first. Not persisted across app restart.
@@ -195,7 +206,7 @@ Major sections, roughly:
 - **Premultiplied alpha**: don't accidentally output straight RGBA in a fragment shader and blend it premultiplied — the `*color * alpha, alpha` pattern is everywhere on purpose.
 - **View-px constants**: anything that needs to feel constant on screen at any zoom is named `*ViewPx` and divided by `currentViewScale()` at use time. Don't hard-code doc-px sizes for UI affordances.
 - **Bake performance at low zoom**: `bakeCurrentStrokeIntoTiles` skips bbox cells that no sample's brush radius touches, AND `DabEmitter::emit` skips dabs whose footprint is fully outside the per-tile clip bounds. Both optimizations are critical — without them, a long stroke at 0.25× zoom can allocate thousands of tile FBOs and lock up the GL thread.
-- **Tool-rail height**: the rail lives in a `ScrollView`, but it is meant never to scroll — a scrolling rail hides tools and costs a gesture mid-sketch. The device gives it ~810dp of usable height; the current rail is ~685dp at a 40dp per-tile pitch (`kRailTileSizeDp` / `kRailTilePadDp` in `MainActivity`). Each new rail entry eats ~40dp of that headroom, so check it on-device (`adb exec-out screencap -p`) after adding one, and trim tile geometry rather than letting it scroll. Tiles use `CENTER_INSIDE` with 24dp icons, so shrinking a tile below a 24dp content box starts shrinking the glyph too.
+- **Tool-rail height**: the rail lives in a `ScrollView`, but it is meant never to scroll — a scrolling rail hides tools and costs a gesture mid-sketch. The device gives it ~810dp of usable height; the current rail is ~765dp (17 tiles, after the ruler + compass) at a 40dp per-tile pitch (`kRailTileSizeDp` / `kRailTilePadDp` in `MainActivity`). Each new rail entry eats ~40dp of that headroom, so check it on-device (`adb exec-out screencap -p`) after adding one, and trim tile geometry rather than letting it scroll. Tiles use `CENTER_INSIDE` with 24dp icons, so shrinking a tile below a 24dp content box starts shrinking the glyph too.
 
 ## Memory
 
