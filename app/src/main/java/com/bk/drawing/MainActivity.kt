@@ -2705,6 +2705,17 @@ class MainActivity : AppCompatActivity() {
         var pageW = NativeRenderer.getPageWidth()
         var pageH = NativeRenderer.getPageHeight()
         if (pageW <= 0 || pageH <= 0) {
+            // Launch: the sidebar is built before the surface has a size,
+            // so native has no page rect yet. Use the document's saved
+            // size — otherwise the bitmaps come out at the fallback
+            // dimensions, no cached thumbnail matches them, and every
+            // page gets loaded just to redraw its thumbnail (18 s of
+            // background loading on a 7-page 4300x5980 doc).
+            val saved = if (currentDocName.isNotEmpty())
+                readPageSize(docDirFor(currentDocName)) else null
+            if (saved != null) { pageW = saved.first; pageH = saved.second }
+        }
+        if (pageW <= 0 || pageH <= 0) {
             pageW = drawingView?.width ?: 0
             pageH = drawingView?.height ?: 0
         }

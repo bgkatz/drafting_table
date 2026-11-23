@@ -1057,6 +1057,17 @@ public:
                 reapLater_(p);
             });
     }
+    // Allocate `n` buffers into the pool (capped), from whatever thread
+    // calls this. Used off the GL thread at launch so the first document
+    // load finds its buffers waiting instead of paying ~3-4 ms each.
+    void prewarm(size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            auto* p = new std::vector<uint8_t>(kTileBytes);
+            std::lock_guard<std::mutex> lock(mu_);
+            if (free_.size() >= kMaxPoolSize) { delete p; return; }
+            free_.push_back(p);
+        }
+    }
     // Shrink the idle pool to `keep` buffers (app going to background).
     void trim(size_t keep) {
         std::vector<std::vector<uint8_t>*> out;
@@ -1859,6 +1870,11 @@ LoadStats  g_laterLoad;
 LoadStats* g_loadAcc = nullptr;        // non-null while a timed load runs
 int64_t    g_docCloseNs = 0;           // tearing down the previous doc
 std::atomic<int> g_loadReportSeq{0};
+
+// Thumbnail-cache outcomes since the last document load, for the load
+// report: [0] used, [1] no file, [2] wrong size, [3] stale, [4] page
+// setup changed.
+int g_thumbStats[5] = {0, 0, 0, 0, 0};
 
 inline int64_t nowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -6135,6 +6151,7 @@ void ensureLoaded() {
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
     g_docLoad = LoadStats{};
     g_laterLoad = LoadStats{};
+    for (int& v : g_thumbStats) v = 0;
     g_loadAcc = &g_docLoad;
     int64_t t0 = nowNs();
     loadAllLayersFromDisk();
@@ -11437,6 +11454,42 @@ Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring 
     // The GL-touching parts (raster tile uploads, vector shape tables)
     // still happen lazily via ensureLoaded on the next render pass.
     loadAllPageMetadataFromDisk();
+
+    // Launch: the GL context is still hundreds of ms away. Use that time
+    // to allocate the tile buffers the first load will want — one per
+    // tile file in the active page's visible / active raster layers
+    // (the same set loadPageLayersFromDisk will read) — on a background
+    // thread. Measured without this: 322 tiles spent 1.27 s of a 1.9 s
+    // launch load in allocation.
+    std::vector<std::string> dirs;
+    if (g_activePageIdx < g_pages.size() && g_pages[g_activePageIdx]) {
+        Page& page = *g_pages[g_activePageIdx];
+        for (size_t i = 0; i < page.layers.size(); ++i) {
+            Layer* l = page.layers[i].get();
+            if (!l || l->type != LayerType::Raster) continue;
+            if (i != page.activeLayer
+                && !l->visible.load(std::memory_order_relaxed)) continue;
+            dirs.push_back(layerDirIn(g_activePageIdx, i));
+        }
+    }
+    // Once per process: a later call (document rename) has a warm pool.
+    static std::atomic<bool> prewarmed{false};
+    if (!dirs.empty() && !prewarmed.exchange(true)) {
+        std::thread([dirs] {
+            size_t count = 0;
+            for (const auto& dir : dirs) {
+                DIR* d = opendir(dir.c_str());
+                if (!d) continue;
+                struct dirent* e;
+                while ((e = readdir(d)) != nullptr) {
+                    if (std::strncmp(e->d_name, "tile_", 5) == 0) ++count;
+                }
+                closedir(d);
+            }
+            // The pool's own first-acquire prewarm covers the first 32.
+            tilePool().prewarm(std::min<size_t>(count, 1536));
+        }).detach();
+    }
 }
 
 // Switch the active document at runtime. Frees the current doc's GL
@@ -14043,11 +14096,11 @@ Java_com_bk_drawing_NativeRenderer_loadCachedPageThumbnail(
         || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return JNI_FALSE;
     std::string path = thumbPathOf(static_cast<size_t>(pageIdx));
     struct stat st;
-    if (stat(path.c_str(), &st) != 0) return JNI_FALSE;
+    if (stat(path.c_str(), &st) != 0) { ++g_thumbStats[1]; return JNI_FALSE; }
     size_t want = sizeof(ThumbHeader)
                 + static_cast<size_t>(info.width) * info.height * 4;
-    if (static_cast<size_t>(st.st_size) != want) return JNI_FALSE;
-    if (thumbStale(static_cast<size_t>(pageIdx), st)) return JNI_FALSE;
+    if (static_cast<size_t>(st.st_size) != want) { ++g_thumbStats[2]; return JNI_FALSE; }
+    if (thumbStale(static_cast<size_t>(pageIdx), st)) { ++g_thumbStats[3]; return JNI_FALSE; }
     FILE* f = fopen(path.c_str(), "rb");
     if (!f) return JNI_FALSE;
     ThumbHeader hdr{};
@@ -14059,6 +14112,7 @@ Java_com_bk_drawing_NativeRenderer_loadCachedPageThumbnail(
         float sig[8];
         fillThumbSignature(sig);
         ok = std::memcmp(sig, hdr.sig, sizeof(sig)) == 0;
+        if (!ok) ++g_thumbStats[4];
     }
     if (ok) {
         std::vector<uint8_t> px(static_cast<size_t>(hdr.w) * hdr.h * 4);
@@ -14077,6 +14131,7 @@ Java_com_bk_drawing_NativeRenderer_loadCachedPageThumbnail(
         }
     }
     fclose(f);
+    if (ok) ++g_thumbStats[0];
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
@@ -14104,7 +14159,7 @@ Java_com_bk_drawing_NativeRenderer_getLoadReport(JNIEnv* env, jobject) {
     auto ms = [](int64_t ns) { return static_cast<long long>(ns / 1000000); };
     const LoadStats d = g_docLoad;
     const LoadStats l = g_laterLoad;
-    char buf[640];
+    char buf[800];
     std::snprintf(buf, sizeof(buf),
         "Closing previous document: %lld ms\n"
         "Loading this document: %lld ms\n"
@@ -14116,10 +14171,15 @@ Java_com_bk_drawing_NativeRenderer_getLoadReport(JNIEnv* env, jobject) {
         "\n"
         "Loaded since (pages opened, thumbnails, layers shown):\n"
         "  %d loads, %d tiles, %lld ms\n"
-        "  disk %lld ms, memory %lld ms, GPU %lld ms",
+        "  disk %lld ms, memory %lld ms, GPU %lld ms\n"
+        "\n"
+        "Saved thumbnails: %d used; not used: %d missing,\n"
+        "  %d wrong size, %d out of date, %d page setup changed",
         ms(g_docCloseNs), ms(d.totalNs), d.tiles, d.layers,
         ms(d.diskNs), ms(d.memNs), ms(d.glNs), d.deferredLayers,
-        l.events, l.tiles, ms(l.totalNs), ms(l.diskNs), ms(l.memNs), ms(l.glNs));
+        l.events, l.tiles, ms(l.totalNs), ms(l.diskNs), ms(l.memNs), ms(l.glNs),
+        g_thumbStats[0], g_thumbStats[1], g_thumbStats[2], g_thumbStats[3],
+        g_thumbStats[4]);
     return env->NewStringUTF(buf);
 }
 
