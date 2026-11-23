@@ -14015,12 +14015,19 @@ static void fillThumbSignature(float sig[8]) {
     PageClip pc = readPageClip();
     sig[0] = pc.active ? (pc.maxX - pc.minX) : 0.0f;
     sig[1] = pc.active ? (pc.maxY - pc.minY) : 0.0f;
-    sig[2] = static_cast<float>(g_gridEnabled.load());
-    sig[3] = static_cast<float>(g_gridStyle.load());
-    sig[4] = g_gridSpacing.load();
-    sig[5] = static_cast<float>(g_marginEnabled.load());
-    sig[6] = g_marginTop.load();
-    sig[7] = g_marginSide.load();
+    // Only what is actually drawn. With the grid (or margins) off, the
+    // style / spacing (or insets) are whatever the previously open
+    // document left in the globals — Kotlin only pushes the grid style
+    // when the grid is on — and comparing them made every thumbnail look
+    // out of date after switching from a document with a different grid.
+    bool grid = g_gridEnabled.load() != 0;
+    bool margins = g_marginEnabled.load() != 0;
+    sig[2] = grid ? 1.0f : 0.0f;
+    sig[3] = grid ? static_cast<float>(g_gridStyle.load()) : 0.0f;
+    sig[4] = grid ? g_gridSpacing.load() : 0.0f;
+    sig[5] = margins ? 1.0f : 0.0f;
+    sig[6] = margins ? g_marginTop.load() : 0.0f;
+    sig[7] = margins ? g_marginSide.load() : 0.0f;
 }
 
 static bool mtimeNewer(const struct stat& a, const struct stat& b) {
