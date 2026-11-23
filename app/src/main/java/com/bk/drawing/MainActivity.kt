@@ -586,6 +586,14 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStop() {
+        super.onStop()
+        // No longer visible: hand back the tile buffers the native pool
+        // keeps around to make document switches fast (up to 512 MB
+        // after closing a large document).
+        NativeRenderer.trimTilePool()
+    }
+
     override fun onPause() {
         // Tile writes are queued onto a background thread for the
         // duration of a session; force them to disk before we hand

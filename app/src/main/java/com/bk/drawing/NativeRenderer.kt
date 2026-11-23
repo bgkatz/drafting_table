@@ -681,6 +681,10 @@ object NativeRenderer {
      *  is missing / stale. GL thread only. */
     external fun loadCachedPageThumbnail(pageIdx: Int, bitmap: android.graphics.Bitmap): Boolean
 
+    /** Release the idle tile buffers kept for fast document switches
+     *  (call when the app goes to the background). Any thread. */
+    external fun trimTilePool()
+
     /** Bumped each time a document finishes loading. */
     external fun getLoadReportSeq(): Int
     /** Text breakdown of the last document load (close / disk / memory /

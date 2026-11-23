@@ -979,7 +979,14 @@ struct Tile {
 class TileBufferPool {
     std::mutex mu_;
     std::vector<std::vector<uint8_t>*> free_;
-    static constexpr size_t kMaxPoolSize = 64;
+    // Sized for a document switch, not just for undo churn: measured on
+    // the MovinkPad, allocating a 256 KB mirror costs ~3-4 ms and freeing
+    // one about the same (closing a fully-loaded 4300x5980 document took
+    // 12 s, nearly all of it frees). Keeping a closed document's buffers
+    // here makes closing it and loading the next one cost neither.
+    // 2048 buffers = 512 MB at most; trim() hands them back when the app
+    // goes to the background.
+    static constexpr size_t kMaxPoolSize = 2048;
     // Pre-warmed at first acquire so the early commits (before any
     // undo eviction recycles buffers) pay zero allocation cost.
     static constexpr size_t kPrewarmCount = 32;
@@ -990,6 +997,40 @@ class TileBufferPool {
         for (size_t i = 0; i < kPrewarmCount; ++i) {
             free_.push_back(new std::vector<uint8_t>(kTileBytes));
         }
+    }
+
+    // Buffers the pool has no room for are freed on a background thread,
+    // a few at a time: a free is milliseconds, and thousands of them
+    // inline is what froze the GL thread at document close.
+    std::mutex reapMu_;
+    std::condition_variable reapCv_;
+    std::deque<std::vector<uint8_t>*> reap_;
+    bool reaperStarted_ = false;
+    void reapLoop_() {
+        for (;;) {
+            std::vector<uint8_t>* p = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(reapMu_);
+                reapCv_.wait(lock, [this] { return !reap_.empty(); });
+                p = reap_.front();
+                reap_.pop_front();
+            }
+            delete p;
+            // Yield between frees so the unmaps don't crowd whatever the
+            // GL thread is doing.
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+    }
+    void reapLater_(std::vector<uint8_t>* p) {
+        {
+            std::lock_guard<std::mutex> lock(reapMu_);
+            reap_.push_back(p);
+            if (!reaperStarted_) {
+                reaperStarted_ = true;
+                std::thread([this] { reapLoop_(); }).detach();
+            }
+        }
+        reapCv_.notify_one();
     }
 public:
     ~TileBufferPool() {
@@ -1009,10 +1050,24 @@ public:
         return std::shared_ptr<std::vector<uint8_t>>(
             raw,
             [this](std::vector<uint8_t>* p) {
-                std::lock_guard<std::mutex> lock(mu_);
-                if (free_.size() < kMaxPoolSize) free_.push_back(p);
-                else delete p;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    if (free_.size() < kMaxPoolSize) { free_.push_back(p); return; }
+                }
+                reapLater_(p);
             });
+    }
+    // Shrink the idle pool to `keep` buffers (app going to background).
+    void trim(size_t keep) {
+        std::vector<std::vector<uint8_t>*> out;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            while (free_.size() > keep) {
+                out.push_back(free_.back());
+                free_.pop_back();
+            }
+        }
+        for (auto* p : out) reapLater_(p);
     }
 };
 
@@ -5774,27 +5829,40 @@ void loadTilesIntoLayer(Layer& layer, const std::string& dir) {
     DIR* d = opendir(dir.c_str());
     if (!d) return;
 
-    std::vector<uint8_t> buf(kTileBytes);
     int loaded = 0;
     struct dirent* e;
     while ((e = readdir(d)) != nullptr) {
         int tx, ty;
         if (sscanf(e->d_name, "tile_%d_%d.bin", &tx, &ty) != 2) continue;
+        if (layer.tiles.find(tileKey(tx, ty)) != layer.tiles.end()) continue;
         std::string path = dir + "/" + e->d_name;
+        // Read straight into the buffer that becomes the tile's CPU
+        // mirror: no scratch buffer, no copy. From the pool, so after a
+        // document switch it is one the previous document just released.
+        int64_t tMem0 = g_loadAcc ? nowNs() : 0;
+        TileBytes bytes = tilePool().acquire();
         int64_t tDisk0 = g_loadAcc ? nowNs() : 0;
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) {
             LOGE("can't open %s", path.c_str());
             continue;
         }
-        size_t n = fread(buf.data(), 1, buf.size(), f);
+        size_t n = fread(bytes->data(), 1, kTileBytes, f);
         fclose(f);
-        if (g_loadAcc) g_loadAcc->diskNs += nowNs() - tDisk0;
-        if (n != buf.size()) {
+        int64_t tGl0 = g_loadAcc ? nowNs() : 0;
+        if (n != kTileBytes) {
             LOGE("tile %s short read: %zu bytes", e->d_name, n);
             continue;
         }
-        getOrCreateTile(layer, tx, ty, buf.data());
+        Tile t;
+        createTileGl(t, tx, ty, bytes->data());
+        t.cachedBytes = std::move(bytes);
+        layer.tiles[tileKey(tx, ty)] = t;
+        if (g_loadAcc) {
+            g_loadAcc->memNs  += tDisk0 - tMem0;
+            g_loadAcc->diskNs += tGl0 - tDisk0;
+            g_loadAcc->glNs   += nowNs() - tGl0;
+        }
         ++loaded;
     }
     closedir(d);
@@ -14012,6 +14080,14 @@ Java_com_bk_drawing_NativeRenderer_loadCachedPageThumbnail(
     return ok ? JNI_TRUE : JNI_FALSE;
 }
 
+// The app went to the background: give back the idle tile buffers a
+// closed document left in the pool (up to 512 MB). Freed on the pool's
+// background thread.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_trimTilePool(JNIEnv*, jobject) {
+    tilePool().trim(64);
+}
+
 // ---- Load timing report ----------------------------------------------------
 
 // Bumped each time a document finishes loading.
@@ -14034,7 +14110,7 @@ Java_com_bk_drawing_NativeRenderer_getLoadReport(JNIEnv* env, jobject) {
         "Loading this document: %lld ms\n"
         "  %d tiles in %d raster layers\n"
         "  disk read %lld ms\n"
-        "  memory copy %lld ms\n"
+        "  memory setup %lld ms\n"
         "  GPU upload %lld ms\n"
         "  %d hidden layers skipped\n"
         "\n"
