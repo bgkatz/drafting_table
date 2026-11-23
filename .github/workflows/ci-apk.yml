@@ -36,6 +36,22 @@ jobs:
         with:
           gradle-version: "8.7"
 
+      # AGP installs the NDK / CMake it needs on demand, but that download
+      # sometimes fails and takes the whole build with it. Do it up front,
+      # with retries. Versions: AGP 8.5.2's default NDK, and the CMake
+      # pinned in app/build.gradle.kts.
+      - name: Install NDK and CMake
+        run: |
+          for i in 1 2 3 4; do
+            if yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+                 "ndk;26.1.10909125" "cmake;3.22.1" > /dev/null; then
+              exit 0
+            fi
+            echo "sdkmanager attempt $i failed; retrying"
+            sleep $((i * 15))
+          done
+          exit 1
+
       - name: Build CI APK
         run: gradle :app:assembleCi -PciVersionCode=${{ github.run_number }} --stacktrace
 
