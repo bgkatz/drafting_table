@@ -125,6 +125,14 @@ Filling is `kPolyVS/FS` + a two-pass stencil (winding via `GL_INCR/DECR_WRAP` on
 - Persisted per **document** in `<docDir>/guides.txt` (not per page — page dirs are renumbered by queued native ops, so a Kotlin-side per-page file would race them).
 - The overlay is a plain non-clickable View above the SurfaceView, so guides never reach page pixels, thumbnails or exports. It must be invalidated on view-transform changes (`onViewTransformChanged`).
 
+### Document load: what is and isn't read
+
+Switching documents loads metadata for every page but **content only for the active page**, and within a page **only layers that are visible or active**:
+
+- **Deferred hidden layers** (`Layer::tilesPending`, `Page::pendingLayers`): at page load a raster layer that is hidden and not the active layer keeps its tiles on disk. `loadPendingLayers(page, all=false)` runs at the tail of `applyPendingLayerActions` — i.e. at the top of every GL-thread operation, actions queued or not — and loads any pending layer that has since become visible (the UI thread flips `visible` directly) or active. Structural actions (delete / move / merge / rasterize) call it with `all=true` first, because they snapshot or renumber arbitrary layers. **The invariant: a layer is pending only while hidden AND not active, and nothing writes to such a layer** — a write would create fresh tiles over the ones it never read. Any new code path that can touch a layer other than the active / visible ones must call `loadPendingLayers(..., true)` first. Layers go pending only at load and never back.
+- **Thumbnail disk cache** (`<pageDir>/thumb.bin`, `saveThumbToCache` / `loadCachedPageThumbnail`): a sidebar refresh used to composite every page, which loaded every page. Now a page that isn't resident shows its cached thumbnail; only pages with no fresh cache render live. Freshness comes from the filesystem (cache mtime vs each layer dir, `shapes.bin`, `opacity.txt`) plus a header signature of page size and grid / margin setup, so edits made with the sidebar closed are caught. The cache is written **in place through the disk-writer queue** — in place so it doesn't bump the page dir's mtime, queued so it lands after tile writes ahead of it. Don't switch it to tmp + rename.
+- **Load timing**: the status bar's `load:` chip shows tap-to-first-frame for the last document switch; tapping it shows the native breakdown (`g_docLoad` / `g_laterLoad`: close previous doc, disk read, memory copy, GPU upload, hidden layers skipped, and everything loaded since).
+
 ### Undo / redo
 
 Single global stack on the native side (`g_undoStack` / `g_redoStack`, `std::deque<UndoEntry>`, mutex-guarded). Bounded by **50 entries / 200 MB combined**; oldest entries evict first. Not persisted across app restart.

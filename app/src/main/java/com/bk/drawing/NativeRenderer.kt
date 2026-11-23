@@ -675,6 +675,18 @@ object NativeRenderer {
      */
     external fun getPageCount(): Int
     external fun getActivePage(): Int
+    /** Fill [bitmap] from the page's on-disk thumbnail cache
+     *  (<pageDir>/thumb.bin, written by renderPageThumbnail). False when
+     *  the page is already loaded (render it live instead) or the cache
+     *  is missing / stale. GL thread only. */
+    external fun loadCachedPageThumbnail(pageIdx: Int, bitmap: android.graphics.Bitmap): Boolean
+
+    /** Bumped each time a document finishes loading. */
+    external fun getLoadReportSeq(): Int
+    /** Text breakdown of the last document load (close / disk / memory /
+     *  GPU) plus what has been loaded since. */
+    external fun getLoadReport(): String
+
     external fun addPage()
     external fun switchPage(idx: Int)
 

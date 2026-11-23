@@ -123,6 +123,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusAngleText:   TextView
     private lateinit var statusPreviewText: TextView
     private lateinit var statusPredictText: TextView
+    private lateinit var statusLoadText:    TextView
+    // uptimeMillis when the current document load was requested (0 =
+    // launch load, timed natively only).
+    private var docLoadStartMs = 0L
     private lateinit var statusPageText:  TextView
 
     // ---- Page sidebar (restyled to 84dp) -------------------------------
@@ -417,6 +421,7 @@ class MainActivity : AppCompatActivity() {
             v.onPenLeft     = { brushPreviewView.hide() }
             v.brushPressureSaturation = brushPressureSaturation
             v.guides = guides
+            v.onDocumentLoaded = { onDocumentLoaded() }
             v.pointSnapEnabled = snapEnabled
             v.gridSpacingDoc = gridSpacing.toFloat()
             // App-wide (not per doc), like the snap toggles themselves.
@@ -2972,6 +2977,12 @@ class MainActivity : AppCompatActivity() {
             setTextColor(getColor(
                 if (predictionEnabled) R.color.hot else R.color.inkSoft))
         }
+        // Last document load time. Tap for where it went (close old doc /
+        // disk / memory / GPU) and what has been loaded since.
+        statusLoadText = makeStatusText("load: —").apply {
+            isClickable = true; isFocusable = true
+            setOnClickListener { showLoadReport() }
+        }
         statusPageText = makeStatusText("page —")
 
         bar.addView(statusDocText,    statusItemLp())
@@ -2984,6 +2995,7 @@ class MainActivity : AppCompatActivity() {
         bar.addView(statusAngleText,  statusItemLp())
         bar.addView(statusPreviewText, statusItemLp())
         bar.addView(statusPredictText, statusItemLp())
+        bar.addView(statusLoadText,   statusItemLp())
         // Spacer pushes pageText to the right edge.
         bar.addView(View(this), LinearLayout.LayoutParams(
             0, 0, 1.0f))
@@ -3139,6 +3151,39 @@ class MainActivity : AppCompatActivity() {
             letterSpacing = 0.08f
             setTextColor(getColor(R.color.ink))
         }
+
+    // ---- Load timing ------------------------------------------------------
+
+    private var lastDocLoadWallMs = -1L
+
+    /** A document load finished and its first frame is on screen. */
+    private fun onDocumentLoaded() {
+        lastDocLoadWallMs = if (docLoadStartMs > 0L)
+            android.os.SystemClock.uptimeMillis() - docLoadStartMs else -1L
+        docLoadStartMs = 0L
+        if (!::statusLoadText.isInitialized) return
+        statusLoadText.text = if (lastDocLoadWallMs >= 0)
+            "load: %.1f s".format(lastDocLoadWallMs / 1000f) else "load: launch"
+    }
+
+    private fun showLoadReport() {
+        val pad = 18.dp
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(pad, pad, pad, pad)
+        }
+        container.addView(makePaperDialogTitle("Document load"))
+        val head = if (lastDocLoadWallMs >= 0)
+            "Tap to first frame: $lastDocLoadWallMs ms\n\n" else ""
+        container.addView(TextView(this).apply {
+            typeface = fontMono ?: Typeface.MONOSPACE
+            textSize = 12f
+            setTextColor(getColor(R.color.ink))
+            text = head + NativeRenderer.getLoadReport()
+            setPadding(0, 10.dp, 0, 0)
+        })
+        showPaperDialog(container)
+    }
 
     /** Wrap [content] in an AlertDialog whose window is paper-colored.
      *  Returns the dialog so the caller can dismiss it from button
@@ -4780,6 +4825,7 @@ class MainActivity : AppCompatActivity() {
         loadPageSetup(dir)
         loadGuides(dir)
         if (::statusDocText.isInitialized) statusDocText.text = "doc · $name"
+        docLoadStartMs = android.os.SystemClock.uptimeMillis()
         NativeRenderer.loadDocument(dir.absolutePath)
         drawingView?.forceRedraw()
         // Frame the new doc's page in the visible canvas, same as the
