@@ -325,6 +325,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 bufferInfo.width, bufferInfo.height,
                 composed
             )
+            // A document finished loading in this pass: let the UI show
+            // the timing (this point includes the first composite).
+            val loadSeq = NativeRenderer.getLoadReportSeq()
+            if (loadSeq != lastLoadReportSeq) {
+                lastLoadReportSeq = loadSeq
+                post { onDocumentLoaded?.invoke() }
+            }
             // Text boxes whose raster is missing (fresh load, undo,
             // paste) or stale for this zoom get re-rasterized on the
             // UI thread; the upload lands on the next pass.
@@ -367,9 +374,16 @@ class DrawingSurfaceView @JvmOverloads constructor(
                         // always rendered below, so queuing it would just
                         // make us composite it twice.
                         thumbnailRefreshQueue.clear()
-                        for (idx in targets.keys) {
+                        for ((idx, bitmap) in targets) {
                             if (idx in 0 until pageCount && idx != activePage) {
-                                thumbnailRefreshQueue.addLast(idx)
+                                // A page that isn't loaded shows its
+                                // cached thumbnail instead of being
+                                // pulled off disk just to draw one;
+                                // only pages without a fresh cache (or
+                                // already resident) render live.
+                                if (!NativeRenderer.loadCachedPageThumbnail(idx, bitmap)) {
+                                    thumbnailRefreshQueue.addLast(idx)
+                                }
                             }
                         }
                     }
@@ -430,6 +444,11 @@ class DrawingSurfaceView @JvmOverloads constructor(
             }
         }
     }
+
+    /** UI thread: a document load completed and its first frame has been
+     *  composited. */
+    var onDocumentLoaded: (() -> Unit)? = null
+    private var lastLoadReportSeq = -1
 
     // Export render queue. queueExportRender stashes a request from the
     // UI thread; the next onDrawMultiBufferedLayer drains it and fills

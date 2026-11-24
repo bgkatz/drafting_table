@@ -979,7 +979,14 @@ struct Tile {
 class TileBufferPool {
     std::mutex mu_;
     std::vector<std::vector<uint8_t>*> free_;
-    static constexpr size_t kMaxPoolSize = 64;
+    // Sized for a document switch, not just for undo churn: measured on
+    // the MovinkPad, allocating a 256 KB mirror costs ~3-4 ms and freeing
+    // one about the same (closing a fully-loaded 4300x5980 document took
+    // 12 s, nearly all of it frees). Keeping a closed document's buffers
+    // here makes closing it and loading the next one cost neither.
+    // 2048 buffers = 512 MB at most; trim() hands them back when the app
+    // goes to the background.
+    static constexpr size_t kMaxPoolSize = 2048;
     // Pre-warmed at first acquire so the early commits (before any
     // undo eviction recycles buffers) pay zero allocation cost.
     static constexpr size_t kPrewarmCount = 32;
@@ -990,6 +997,40 @@ class TileBufferPool {
         for (size_t i = 0; i < kPrewarmCount; ++i) {
             free_.push_back(new std::vector<uint8_t>(kTileBytes));
         }
+    }
+
+    // Buffers the pool has no room for are freed on a background thread,
+    // a few at a time: a free is milliseconds, and thousands of them
+    // inline is what froze the GL thread at document close.
+    std::mutex reapMu_;
+    std::condition_variable reapCv_;
+    std::deque<std::vector<uint8_t>*> reap_;
+    bool reaperStarted_ = false;
+    void reapLoop_() {
+        for (;;) {
+            std::vector<uint8_t>* p = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(reapMu_);
+                reapCv_.wait(lock, [this] { return !reap_.empty(); });
+                p = reap_.front();
+                reap_.pop_front();
+            }
+            delete p;
+            // Yield between frees so the unmaps don't crowd whatever the
+            // GL thread is doing.
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+    }
+    void reapLater_(std::vector<uint8_t>* p) {
+        {
+            std::lock_guard<std::mutex> lock(reapMu_);
+            reap_.push_back(p);
+            if (!reaperStarted_) {
+                reaperStarted_ = true;
+                std::thread([this] { reapLoop_(); }).detach();
+            }
+        }
+        reapCv_.notify_one();
     }
 public:
     ~TileBufferPool() {
@@ -1009,10 +1050,35 @@ public:
         return std::shared_ptr<std::vector<uint8_t>>(
             raw,
             [this](std::vector<uint8_t>* p) {
-                std::lock_guard<std::mutex> lock(mu_);
-                if (free_.size() < kMaxPoolSize) free_.push_back(p);
-                else delete p;
+                {
+                    std::lock_guard<std::mutex> lock(mu_);
+                    if (free_.size() < kMaxPoolSize) { free_.push_back(p); return; }
+                }
+                reapLater_(p);
             });
+    }
+    // Allocate `n` buffers into the pool (capped), from whatever thread
+    // calls this. Used off the GL thread at launch so the first document
+    // load finds its buffers waiting instead of paying ~3-4 ms each.
+    void prewarm(size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            auto* p = new std::vector<uint8_t>(kTileBytes);
+            std::lock_guard<std::mutex> lock(mu_);
+            if (free_.size() >= kMaxPoolSize) { delete p; return; }
+            free_.push_back(p);
+        }
+    }
+    // Shrink the idle pool to `keep` buffers (app going to background).
+    void trim(size_t keep) {
+        std::vector<std::vector<uint8_t>*> out;
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            while (free_.size() > keep) {
+                out.push_back(free_.back());
+                free_.pop_back();
+            }
+        }
+        for (auto* p : out) reapLater_(p);
     }
 };
 
@@ -1140,6 +1206,14 @@ struct Layer {
     // as `visible`. Persisted at <layerDir>/opacity.txt; absence means
     // 1.0 (the default for layers created before this feature existed).
     std::atomic<float> opacity{1.0f};
+    // Raster tiles still on disk. Set at page load for a layer that is
+    // hidden and not the active layer: nothing can show or touch its
+    // pixels, so reading and uploading them is deferred until it is
+    // shown, made active, or a structural op needs it. GL thread only.
+    // See loadPendingLayers — the rules there are what keep a pending
+    // layer from ever being written to (which would clobber the tiles
+    // it never loaded).
+    bool tilesPending = false;
 };
 
 // A document Page wraps a layer stack plus an active-layer index. All
@@ -1158,6 +1232,12 @@ struct Page {
     // content up front is what made switching documents take seconds.
     // See ensurePageContentLoaded.
     bool contentLoaded = false;
+    // Number of layers with tilesPending set; lets the per-operation
+    // check in loadPendingLayers cost one compare.
+    int pendingLayers = 0;
+    // Hash of the last sidebar thumbnail written to <pageDir>/thumb.bin
+    // (0 = none this session), so an unchanged re-render isn't re-saved.
+    uint64_t thumbHash = 0;
 };
 
 struct DabProg {
@@ -1767,6 +1847,38 @@ inline std::string pageDirOf(size_t pageIdx) {
 }
 inline std::string layerDirIn(size_t pageIdx, size_t layerIdx) {
     return pageDirOf(pageIdx) + "/layer_" + std::to_string(layerIdx);
+}
+
+// ---- Load timing ----------------------------------------------------------
+// Where a document load's time goes, for the status-bar "load" chip.
+// Accumulated on the GL thread while tiles are read; formatted on demand
+// by getLoadReport. g_docLoad covers the document switch itself,
+// g_laterLoad everything pulled in afterwards (other pages for
+// thumbnails / page switches, hidden layers being shown).
+struct LoadStats {
+    int     tiles = 0;
+    int     layers = 0;
+    int     deferredLayers = 0;
+    int64_t diskNs = 0;    // fopen + fread
+    int64_t memNs = 0;     // CPU mirror: buffer acquire + memcpy
+    int64_t glNs = 0;      // texture + FBO create, clear, upload
+    int64_t totalNs = 0;
+    int     events = 0;
+};
+LoadStats  g_docLoad;
+LoadStats  g_laterLoad;
+LoadStats* g_loadAcc = nullptr;        // non-null while a timed load runs
+int64_t    g_docCloseNs = 0;           // tearing down the previous doc
+std::atomic<int> g_loadReportSeq{0};
+
+// Thumbnail-cache outcomes since the last document load, for the load
+// report: [0] used, [1] no file, [2] wrong size, [3] stale, [4] page
+// setup changed.
+int g_thumbStats[5] = {0, 0, 0, 0, 0};
+
+inline int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 // Most callers operate on the active page implicitly (stroke commit,
 // vector mutations, undo apply). They use this convenience wrapper.
@@ -2682,6 +2794,7 @@ void ensureAtLeastOnePage();
 void closeCurrentDocument();
 void ensureLoaded();
 void ensurePageContentLoaded(size_t pageIdx);
+void loadPendingLayers(size_t pageIdx, bool all);
 bool liftRasterSelectionRect(float x0, float y0, float x1, float y1);
 bool liftRasterSelectionPolygon(const float* points, size_t nPoints);
 void commitRasterSelectionImpl();
@@ -2727,6 +2840,13 @@ void applyPendingLayerActions() {
         drainPendingSaveTiles();
     }
     for (int a : actions) {
+        // Ops that snapshot, renumber or merge arbitrary layers need
+        // every deferred layer resident first.
+        if (a == kActionDeleteLayer || a == kActionMoveLayer
+            || a == kActionRasterizeLayer || a == kActionRasterizeShapeBelow
+            || a == kActionMergeLayerDown) {
+            loadPendingLayers(g_activePageIdx, /*all=*/true);
+        }
         if (a == kActionAddLayer) {
             size_t prevActive = activeLayer();
             layers().push_back(std::make_unique<Layer>());
@@ -2886,7 +3006,9 @@ void applyPendingLayerActions() {
             // guarantees the user's last strokes are persisted before
             // the doc switch is observable.
             flushDiskWriter();
+            int64_t tClose0 = nowNs();
             closeCurrentDocument();
+            int64_t closeNs = nowNs() - tClose0;
             g_docDir = newPath;
             // The render entry point already called ensureLoaded() before
             // we got here (g_loaded was true at that point so it no-op'd).
@@ -2894,6 +3016,7 @@ void applyPendingLayerActions() {
             // before the SAME pass tries to composite — otherwise layers()
             // dereferences an empty g_pages and we crash.
             ensureLoaded();
+            g_docCloseNs = closeNs;
             LOGI("loaded document: %s", g_docDir.c_str());
         } else if (a == kActionDeleteLayer) {
             int idx = g_pendingDeleteLayerIdx.exchange(-1);
@@ -3069,6 +3192,13 @@ void applyPendingLayerActions() {
             }
         }
     }
+    // Runs on every call, actions or not — this function is drained at
+    // the top of every GL-thread operation, which makes it the one place
+    // that guarantees a layer just shown (UI thread flips `visible`) or
+    // just made active has its tiles before anything uses them.
+    if (g_activePageIdx < g_pages.size()) {
+        loadPendingLayers(g_activePageIdx, /*all=*/false);
+    }
 }
 
 // Guarantees g_pages has at least one page and g_activePageIdx is in
@@ -3143,6 +3273,7 @@ void closeCurrentDocument() {
     }
     g_current.samples.clear();
     g_liveEmitter.reset();
+    g_docCloseNs = 0;
     g_loaded.store(false, std::memory_order_release);
 }
 
@@ -3758,11 +3889,17 @@ Tile& getOrCreateTile(Layer& layer, int tx, int ty,
     if (it != layer.tiles.end()) return it->second;
 
     Tile t;
+    int64_t tGl0 = g_loadAcc ? nowNs() : 0;
     createTileGl(t, tx, ty, initial);
+    int64_t tGl1 = g_loadAcc ? nowNs() : 0;
     if (initial) {
         // Mirror the upload into the BEFORE-snapshot cache. Shared
         // refcounted buffer (from the pool), see TileBytes.
         t.cachedBytes = acquireTileBytesFrom(initial);
+        if (g_loadAcc) {
+            g_loadAcc->glNs  += tGl1 - tGl0;
+            g_loadAcc->memNs += nowNs() - tGl1;
+        }
     } else {
         // Freshly cleared (interior is all zero). Allocate the cache
         // to a zeroed buffer — same memory cost as if it had been
@@ -5708,28 +5845,44 @@ void loadTilesIntoLayer(Layer& layer, const std::string& dir) {
     DIR* d = opendir(dir.c_str());
     if (!d) return;
 
-    std::vector<uint8_t> buf(kTileBytes);
     int loaded = 0;
     struct dirent* e;
     while ((e = readdir(d)) != nullptr) {
         int tx, ty;
         if (sscanf(e->d_name, "tile_%d_%d.bin", &tx, &ty) != 2) continue;
+        if (layer.tiles.find(tileKey(tx, ty)) != layer.tiles.end()) continue;
         std::string path = dir + "/" + e->d_name;
+        // Read straight into the buffer that becomes the tile's CPU
+        // mirror: no scratch buffer, no copy. From the pool, so after a
+        // document switch it is one the previous document just released.
+        int64_t tMem0 = g_loadAcc ? nowNs() : 0;
+        TileBytes bytes = tilePool().acquire();
+        int64_t tDisk0 = g_loadAcc ? nowNs() : 0;
         FILE* f = fopen(path.c_str(), "rb");
         if (!f) {
             LOGE("can't open %s", path.c_str());
             continue;
         }
-        size_t n = fread(buf.data(), 1, buf.size(), f);
+        size_t n = fread(bytes->data(), 1, kTileBytes, f);
         fclose(f);
-        if (n != buf.size()) {
+        int64_t tGl0 = g_loadAcc ? nowNs() : 0;
+        if (n != kTileBytes) {
             LOGE("tile %s short read: %zu bytes", e->d_name, n);
             continue;
         }
-        getOrCreateTile(layer, tx, ty, buf.data());
+        Tile t;
+        createTileGl(t, tx, ty, bytes->data());
+        t.cachedBytes = std::move(bytes);
+        layer.tiles[tileKey(tx, ty)] = t;
+        if (g_loadAcc) {
+            g_loadAcc->memNs  += tDisk0 - tMem0;
+            g_loadAcc->diskNs += tGl0 - tDisk0;
+            g_loadAcc->glNs   += nowNs() - tGl0;
+        }
         ++loaded;
     }
     closedir(d);
+    if (g_loadAcc) { g_loadAcc->tiles += loaded; g_loadAcc->layers += 1; }
     LOGI("loaded %d tiles from %s", loaded, dir.c_str());
 }
 
@@ -5778,7 +5931,6 @@ void loadPageLayersFromDisk(size_t pageIdx, Page& page, bool loadContent = true)
             if (loadContent) loadVectorLayerShapes(layer, dirPath);
         } else {
             layer.type = LayerType::Raster;
-            if (loadContent) loadTilesIntoLayer(layer, dirPath);
         }
         // Optional layer-hidden flag. Presence = layer is hidden in
         // the composite. Absence (the default) = visible. Atomic
@@ -5786,8 +5938,21 @@ void loadPageLayersFromDisk(size_t pageIdx, Page& page, bool loadContent = true)
         // UI thread can flip it from setLayerVisible.
         std::string hiddenPath = dirPath + "/hidden.flag";
         struct stat hst;
-        layer.visible.store(stat(hiddenPath.c_str(), &hst) != 0,
-                            std::memory_order_relaxed);
+        bool visibleOnDisk = stat(hiddenPath.c_str(), &hst) != 0;
+        layer.visible.store(visibleOnDisk, std::memory_order_relaxed);
+        if (loadContent && layer.type == LayerType::Raster
+            && !layer.tilesPending && layer.tiles.empty()) {
+            // A hidden layer that isn't the active one can't be seen or
+            // drawn on: leave its tiles on disk until something needs
+            // them (loadPendingLayers).
+            if (!visibleOnDisk && static_cast<size_t>(idx) != page.activeLayer) {
+                layer.tilesPending = true;
+                ++page.pendingLayers;
+                if (g_loadAcc) g_loadAcc->deferredLayers += 1;
+            } else {
+                loadTilesIntoLayer(layer, dirPath);
+            }
+        }
 
         // Optional opacity. Plain text "0.0".."1.0"; absence = 1.0.
         std::string opacityPath = dirPath + "/opacity.txt";
@@ -5840,8 +6005,71 @@ void ensurePageContentLoaded(size_t pageIdx) {
     if (g_pages[pageIdx]->contentLoaded) return;
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    // Time it into the "later" bucket unless a document load (which has
+    // its own accumulator) is what's driving this.
+    bool ownTiming = (g_loadAcc == nullptr);
+    int64_t t0 = nowNs();
+    if (ownTiming) g_loadAcc = &g_laterLoad;
     loadPageLayersFromDisk(pageIdx, *g_pages[pageIdx], /*loadContent=*/true);
+    if (ownTiming) {
+        g_loadAcc = nullptr;
+        g_laterLoad.totalNs += nowNs() - t0;
+        g_laterLoad.events += 1;
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+}
+
+// Load the tiles of layers that page load deferred (Layer::tilesPending).
+// all=false: only layers that are now visible or active — the cheap
+// check run at the top of every GL-thread operation, so by the time
+// anything composites, reads or bakes, every layer it can reach is
+// resident. all=true: everything, for structural ops (delete / move /
+// merge / rasterize) that snapshot or renumber arbitrary layers.
+//
+// Invariant this maintains: a layer is only ever pending while it is
+// hidden AND not active, and nothing writes to such a layer. Layers go
+// pending only at page load and never return to it.
+void loadPendingLayers(size_t pageIdx, bool all) {
+    if (pageIdx >= g_pages.size() || !g_pages[pageIdx]) return;
+    Page& page = *g_pages[pageIdx];
+    if (page.pendingLayers <= 0) return;
+    GLint prevFbo = 0;
+    GLint vp[4];
+    bool saved = false;
+    GLboolean hadScissor = GL_FALSE;
+    bool ownTiming = (g_loadAcc == nullptr);
+    int64_t t0 = 0;
+    for (size_t i = 0; i < page.layers.size(); ++i) {
+        Layer* layer = page.layers[i].get();
+        if (!layer || !layer->tilesPending) continue;
+        if (!all && i != page.activeLayer
+            && !layer->visible.load(std::memory_order_relaxed)) continue;
+        if (!saved) {
+            glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+            glGetIntegerv(GL_VIEWPORT, vp);
+            // Tile creation clears the whole texture; a live scissor
+            // (partial-recomposite path) would truncate that.
+            hadScissor = glIsEnabled(GL_SCISSOR_TEST);
+            if (hadScissor) glDisable(GL_SCISSOR_TEST);
+            saved = true;
+            t0 = nowNs();
+            if (ownTiming) g_loadAcc = &g_laterLoad;
+        }
+        layer->tilesPending = false;
+        --page.pendingLayers;
+        loadTilesIntoLayer(*layer, layerDirIn(pageIdx, i));
+    }
+    if (saved) {
+        if (ownTiming) {
+            g_loadAcc = nullptr;
+            g_laterLoad.totalNs += nowNs() - t0;
+            g_laterLoad.events += 1;
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+        glViewport(vp[0], vp[1], vp[2], vp[3]);
+        if (hadScissor) glEnable(GL_SCISSOR_TEST);
+        g_mbCacheValid = false;
+    }
 }
 
 void loadAllLayersFromDisk(bool loadContent = true) {
@@ -5921,11 +6149,19 @@ void ensureLoaded() {
 
     GLint prevFbo = 0;
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevFbo);
+    g_docLoad = LoadStats{};
+    g_laterLoad = LoadStats{};
+    for (int& v : g_thumbStats) v = 0;
+    g_loadAcc = &g_docLoad;
+    int64_t t0 = nowNs();
     loadAllLayersFromDisk();
+    g_docLoad.totalNs = nowNs() - t0;
+    g_loadAcc = nullptr;
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
     // Guarantee at least one page exists post-load so subsequent code can
     // freely call layers() / activeLayer() (which deref g_pages).
     ensureAtLeastOnePage();
+    g_loadReportSeq.fetch_add(1);
     // Publish *after* the load is complete — see comment on g_loaded.
     g_loaded.store(true, std::memory_order_release);
 }
@@ -11218,6 +11454,42 @@ Java_com_bk_drawing_NativeRenderer_setDocumentDir(JNIEnv* env, jobject, jstring 
     // The GL-touching parts (raster tile uploads, vector shape tables)
     // still happen lazily via ensureLoaded on the next render pass.
     loadAllPageMetadataFromDisk();
+
+    // Launch: the GL context is still hundreds of ms away. Use that time
+    // to allocate the tile buffers the first load will want — one per
+    // tile file in the active page's visible / active raster layers
+    // (the same set loadPageLayersFromDisk will read) — on a background
+    // thread. Measured without this: 322 tiles spent 1.27 s of a 1.9 s
+    // launch load in allocation.
+    std::vector<std::string> dirs;
+    if (g_activePageIdx < g_pages.size() && g_pages[g_activePageIdx]) {
+        Page& page = *g_pages[g_activePageIdx];
+        for (size_t i = 0; i < page.layers.size(); ++i) {
+            Layer* l = page.layers[i].get();
+            if (!l || l->type != LayerType::Raster) continue;
+            if (i != page.activeLayer
+                && !l->visible.load(std::memory_order_relaxed)) continue;
+            dirs.push_back(layerDirIn(g_activePageIdx, i));
+        }
+    }
+    // Once per process: a later call (document rename) has a warm pool.
+    static std::atomic<bool> prewarmed{false};
+    if (!dirs.empty() && !prewarmed.exchange(true)) {
+        std::thread([dirs] {
+            size_t count = 0;
+            for (const auto& dir : dirs) {
+                DIR* d = opendir(dir.c_str());
+                if (!d) continue;
+                struct dirent* e;
+                while ((e = readdir(d)) != nullptr) {
+                    if (std::strncmp(e->d_name, "tile_", 5) == 0) ++count;
+                }
+                closedir(d);
+            }
+            // The pool's own first-acquire prewarm covers the first 32.
+            tilePool().prewarm(std::min<size_t>(count, 1536));
+        }).detach();
+    }
 }
 
 // Switch the active document at runtime. Frees the current doc's GL
@@ -13712,6 +13984,212 @@ Java_com_bk_drawing_NativeRenderer_switchPage(JNIEnv*, jobject, jint idx) {
 // inside an onDrawMultiBufferedLayer callback after the main composite
 // has finished. The swapping of g_activePageIdx is restored before
 // return so the caller's state is untouched.
+// ---- Sidebar thumbnail disk cache ------------------------------------------
+//
+// <pageDir>/thumb.bin = ThumbHeader + w*h*4 RGBA. Lets a document switch
+// show every page's thumbnail without loading that page's tiles, which
+// is what used to pull the whole document into memory in the background.
+//
+// Freshness is judged from the filesystem, not from bookkeeping, so it
+// survives edits made while the sidebar was closed and app kills:
+// the cache is valid only if it is at least as new as every layer dir
+// (tile writes rename into it, bumping its mtime), shapes.bin and
+// opacity.txt, AND its header matches the current page size and grid /
+// margin setup. The file is written in place (no tmp + rename) through
+// the disk-writer queue: in place so the write doesn't bump the page
+// dir's own mtime, and through the queue so it lands after any tile
+// writes queued before it. A torn write fails the size check and is
+// ignored.
+struct ThumbHeader {
+    uint32_t magic;          // 'THB1'
+    int32_t  w, h;
+    float    sig[8];         // page w/h, grid on/style/spacing, margin on/top/side
+};
+constexpr uint32_t kThumbMagic = 0x31424854u;
+
+static std::string thumbPathOf(size_t pageIdx) {
+    return pageDirOf(pageIdx) + "/thumb.bin";
+}
+
+static void fillThumbSignature(float sig[8]) {
+    PageClip pc = readPageClip();
+    sig[0] = pc.active ? (pc.maxX - pc.minX) : 0.0f;
+    sig[1] = pc.active ? (pc.maxY - pc.minY) : 0.0f;
+    // Only what is actually drawn. With the grid (or margins) off, the
+    // style / spacing (or insets) are whatever the previously open
+    // document left in the globals — Kotlin only pushes the grid style
+    // when the grid is on — and comparing them made every thumbnail look
+    // out of date after switching from a document with a different grid.
+    bool grid = g_gridEnabled.load() != 0;
+    bool margins = g_marginEnabled.load() != 0;
+    sig[2] = grid ? 1.0f : 0.0f;
+    sig[3] = grid ? static_cast<float>(g_gridStyle.load()) : 0.0f;
+    sig[4] = grid ? g_gridSpacing.load() : 0.0f;
+    sig[5] = margins ? 1.0f : 0.0f;
+    sig[6] = margins ? g_marginTop.load() : 0.0f;
+    sig[7] = margins ? g_marginSide.load() : 0.0f;
+}
+
+static bool mtimeNewer(const struct stat& a, const struct stat& b) {
+    if (a.st_mtim.tv_sec != b.st_mtim.tv_sec) return a.st_mtim.tv_sec > b.st_mtim.tv_sec;
+    return a.st_mtim.tv_nsec > b.st_mtim.tv_nsec;
+}
+
+// Is anything in the page's layer dirs newer than its thumbnail?
+static bool thumbStale(size_t pageIdx, const struct stat& thumbSt) {
+    if (pageIdx >= g_pages.size() || !g_pages[pageIdx]) return true;
+    size_t n = g_pages[pageIdx]->layers.size();
+    for (size_t i = 0; i < n; ++i) {
+        std::string dir = layerDirIn(pageIdx, i);
+        struct stat st;
+        if (stat(dir.c_str(), &st) == 0 && mtimeNewer(st, thumbSt)) return true;
+        std::string p = dir + "/shapes.bin";
+        if (stat(p.c_str(), &st) == 0 && mtimeNewer(st, thumbSt)) return true;
+        p = dir + "/opacity.txt";
+        if (stat(p.c_str(), &st) == 0 && mtimeNewer(st, thumbSt)) return true;
+    }
+    return false;
+}
+
+static uint64_t fnv1a(const uint8_t* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    return h ? h : 1;
+}
+
+// Queue a write of a just-rendered sidebar thumbnail. `pixels` is the
+// locked bitmap (stride-aware). Skipped when identical to the last one
+// written for this page — the active page re-renders on every quiet
+// frame, pans included.
+static void saveThumbToCache(size_t pageIdx, const uint8_t* pixels,
+                             int w, int h, int stride) {
+    if (g_docDir.empty() || pageIdx >= g_pages.size() || !g_pages[pageIdx]) return;
+    struct stat dst;
+    if (stat(pageDirOf(pageIdx).c_str(), &dst) != 0) return;   // nothing on disk yet
+    DiskTask task;
+    task.op = DiskTask::kWrite;
+    task.path = thumbPathOf(pageIdx);
+    task.tmpPath = task.path;            // in place, see above
+    task.bytes.resize(sizeof(ThumbHeader) + static_cast<size_t>(w) * h * 4);
+    ThumbHeader hdr{};
+    hdr.magic = kThumbMagic; hdr.w = w; hdr.h = h;
+    fillThumbSignature(hdr.sig);
+    std::memcpy(task.bytes.data(), &hdr, sizeof(hdr));
+    uint8_t* out = task.bytes.data() + sizeof(hdr);
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(out + static_cast<size_t>(y) * w * 4,
+                    pixels + static_cast<size_t>(y) * stride,
+                    static_cast<size_t>(w) * 4);
+    }
+    uint64_t hash = fnv1a(task.bytes.data(), task.bytes.size());
+    if (hash == g_pages[pageIdx]->thumbHash) return;
+    g_pages[pageIdx]->thumbHash = hash;
+    enqueueDiskTask(std::move(task));
+}
+
+// Fill `bitmap` from the page's cached thumbnail. False (bitmap left
+// alone) when the page is already resident — rendering it live is cheap
+// and exact — or the cache is missing, mismatched or stale. GL thread.
+JNIEXPORT jboolean JNICALL
+Java_com_bk_drawing_NativeRenderer_loadCachedPageThumbnail(
+        JNIEnv* env, jobject, jint pageIdx, jobject bitmap) {
+    ensureLoaded();
+    if (g_docDir.empty() || pageIdx < 0
+        || static_cast<size_t>(pageIdx) >= g_pages.size()
+        || !g_pages[pageIdx]) return JNI_FALSE;
+    if (g_pages[pageIdx]->contentLoaded) return JNI_FALSE;
+    AndroidBitmapInfo info;
+    if (AndroidBitmap_getInfo(env, bitmap, &info) < 0
+        || info.format != ANDROID_BITMAP_FORMAT_RGBA_8888) return JNI_FALSE;
+    std::string path = thumbPathOf(static_cast<size_t>(pageIdx));
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) { ++g_thumbStats[1]; return JNI_FALSE; }
+    size_t want = sizeof(ThumbHeader)
+                + static_cast<size_t>(info.width) * info.height * 4;
+    if (static_cast<size_t>(st.st_size) != want) { ++g_thumbStats[2]; return JNI_FALSE; }
+    if (thumbStale(static_cast<size_t>(pageIdx), st)) { ++g_thumbStats[3]; return JNI_FALSE; }
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return JNI_FALSE;
+    ThumbHeader hdr{};
+    bool ok = fread(&hdr, 1, sizeof(hdr), f) == sizeof(hdr)
+           && hdr.magic == kThumbMagic
+           && hdr.w == static_cast<int32_t>(info.width)
+           && hdr.h == static_cast<int32_t>(info.height);
+    if (ok) {
+        float sig[8];
+        fillThumbSignature(sig);
+        ok = std::memcmp(sig, hdr.sig, sizeof(sig)) == 0;
+        if (!ok) ++g_thumbStats[4];
+    }
+    if (ok) {
+        std::vector<uint8_t> px(static_cast<size_t>(hdr.w) * hdr.h * 4);
+        ok = fread(px.data(), 1, px.size(), f) == px.size();
+        void* pixels = nullptr;
+        if (ok && AndroidBitmap_lockPixels(env, bitmap, &pixels) == 0 && pixels) {
+            uint8_t* dst = static_cast<uint8_t*>(pixels);
+            for (int y = 0; y < hdr.h; ++y) {
+                std::memcpy(dst + static_cast<size_t>(y) * info.stride,
+                            px.data() + static_cast<size_t>(y) * hdr.w * 4,
+                            static_cast<size_t>(hdr.w) * 4);
+            }
+            AndroidBitmap_unlockPixels(env, bitmap);
+        } else {
+            ok = false;
+        }
+    }
+    fclose(f);
+    if (ok) ++g_thumbStats[0];
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+// The app went to the background: give back the idle tile buffers a
+// closed document left in the pool (up to 512 MB). Freed on the pool's
+// background thread.
+JNIEXPORT void JNICALL
+Java_com_bk_drawing_NativeRenderer_trimTilePool(JNIEnv*, jobject) {
+    tilePool().trim(64);
+}
+
+// ---- Load timing report ----------------------------------------------------
+
+// Bumped each time a document finishes loading.
+JNIEXPORT jint JNICALL
+Java_com_bk_drawing_NativeRenderer_getLoadReportSeq(JNIEnv*, jobject) {
+    return g_loadReportSeq.load();
+}
+
+// Human-readable breakdown of the last document load plus whatever has
+// been pulled in since. GL-thread state read from the UI thread without
+// a lock: plain ints, display only.
+JNIEXPORT jstring JNICALL
+Java_com_bk_drawing_NativeRenderer_getLoadReport(JNIEnv* env, jobject) {
+    auto ms = [](int64_t ns) { return static_cast<long long>(ns / 1000000); };
+    const LoadStats d = g_docLoad;
+    const LoadStats l = g_laterLoad;
+    char buf[800];
+    std::snprintf(buf, sizeof(buf),
+        "Closing previous document: %lld ms\n"
+        "Loading this document: %lld ms\n"
+        "  %d tiles in %d raster layers\n"
+        "  disk read %lld ms\n"
+        "  memory setup %lld ms\n"
+        "  GPU upload %lld ms\n"
+        "  %d hidden layers skipped\n"
+        "\n"
+        "Loaded since (pages opened, thumbnails, layers shown):\n"
+        "  %d loads, %d tiles, %lld ms\n"
+        "  disk %lld ms, memory %lld ms, GPU %lld ms\n"
+        "\n"
+        "Saved thumbnails: %d used; not used: %d missing,\n"
+        "  %d wrong size, %d out of date, %d page setup changed",
+        ms(g_docCloseNs), ms(d.totalNs), d.tiles, d.layers,
+        ms(d.diskNs), ms(d.memNs), ms(d.glNs), d.deferredLayers,
+        l.events, l.tiles, ms(l.totalNs), ms(l.diskNs), ms(l.memNs), ms(l.glNs),
+        g_thumbStats[0], g_thumbStats[1], g_thumbStats[2], g_thumbStats[3],
+        g_thumbStats[4]);
+    return env->NewStringUTF(buf);
+}
+
 JNIEXPORT void JNICALL
 Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
         JNIEnv* env, jobject,
@@ -13743,6 +14221,7 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     // spreads a full refresh over several frames for exactly that
     // reason (see thumbnailRefreshQueue in DrawingSurfaceView).
     ensurePageContentLoaded(g_activePageIdx);
+    loadPendingLayers(g_activePageIdx, /*all=*/false);
 
     // Fit the page rect into (w, h) with letterboxing. The transform is
     // doc → buffer with the same y direction in both spaces; combined with
@@ -13853,6 +14332,18 @@ Java_com_bk_drawing_NativeRenderer_renderPageThumbnail(
     }
     g_skipPageOutline = savedSkipOutline;
     env->DeleteLocalRef(transformArr);
+
+    // Sidebar thumbnails (chrome on, small) go to the per-page disk
+    // cache; export renders (chrome off) never do.
+    if (drawChrome == JNI_TRUE && w <= 1024 && h <= 1024) {
+        void* pixels = nullptr;
+        if (AndroidBitmap_lockPixels(env, bitmap, &pixels) == 0 && pixels) {
+            saveThumbToCache(static_cast<size_t>(pageIdx),
+                             static_cast<const uint8_t*>(pixels),
+                             w, h, static_cast<int>(info.stride));
+            AndroidBitmap_unlockPixels(env, bitmap);
+        }
+    }
 
     // Restore caller state.
     glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
