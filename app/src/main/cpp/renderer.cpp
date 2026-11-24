@@ -119,6 +119,9 @@ constexpr int   kApron       = 1;
 constexpr int   kTileTexSize = kTileSize + 2 * kApron;
 
 constexpr float kSpacing    = 0.18f;
+// Smallest radius increase (doc-px) that places an in-place growth dab;
+// see DabEmitter::growInPlace.
+constexpr float kGrowMinStep = 0.35f;
 // Pressure → dab-radius range. kMinRadius = 0 lets the lightest pen
 // contact taper to nothing, so the brush has dynamic range across the
 // pen's full pressure curve. The bake/emit path floors spacing
@@ -2657,6 +2660,9 @@ struct DabEmitter {
     float lastY         = 0.0f;
     float lastP         = 0.0f;
     float distToNextDab = 0.0f;
+    // Radius of the most recent dab this emitter placed (tracked whether
+    // or not the clip bounds let it draw). See growInPlace.
+    float lastDabR      = 0.0f;
     // Optional clip bounds (in the same coord frame extend() is called in).
     // Dabs whose square footprint lies entirely outside these bounds are
     // skipped — saving the GL draw call. Used by bake (per-tile bounds);
@@ -2667,6 +2673,7 @@ struct DabEmitter {
     void reset() {
         active = false;
         distToNextDab = 0.0f;
+        lastDabR = 0.0f;
         clipMinX = clipMinY = -1e30f;
         clipMaxX = clipMaxY =  1e30f;
     }
@@ -2689,9 +2696,27 @@ struct DabEmitter {
         return std::max(kSpacing * radiusOf(pressure), kMinSpacing);
     }
 
+    // Dabs are normally placed by distance travelled, so a pen held
+    // still (or creeping) while pressure rises painted nothing until
+    // jitter happened to carry it one spacing along — the stroke widened
+    // in visible jumps. This places a dab at the pen whenever the radius
+    // has grown past the last dab's by a step, travel or not. Growth
+    // only: easing off can't un-paint, here or with a real pen. The step
+    // is half the normal spacing fraction, so pressing in place lays
+    // dabs about as densely as drawing does.
+    void growInPlace(float x, float y, float p) {
+        float r = radiusOf(p);
+        float step = std::max(kGrowMinStep, 0.5f * kSpacing * lastDabR);
+        if (r < lastDabR + step) return;
+        emit(x, y, r);
+        lastDabR = r;
+        distToNextDab = spacingOf(p);
+    }
+
     void extend(float x, float y, float p) {
         if (!active) {
             emit(x, y, radiusOf(p));
+            lastDabR = radiusOf(p);
             active = true;
             lastX = x; lastY = y; lastP = p;
             distToNextDab = spacingOf(p);
@@ -2699,7 +2724,12 @@ struct DabEmitter {
         }
         float dx = x - lastX, dy = y - lastY;
         float dist = std::sqrt(dx * dx + dy * dy);
-        if (dist < 1e-4f) return;
+        if (dist < 1e-4f) {
+            // Same spot, possibly more pressure.
+            growInPlace(x, y, p);
+            lastP = std::max(lastP, p);
+            return;
+        }
         float ux = dx / dist, uy = dy / dist;
 
         float traveled = 0.0f;
@@ -2710,10 +2740,14 @@ struct DabEmitter {
             float dabY = lastY + uy * traveled;
             float dabP = lastP + (p - lastP) * t;
             emit(dabX, dabY, radiusOf(dabP));
+            lastDabR = radiusOf(dabP);
             distToNextDab = spacingOf(dabP);
         }
         distToNextDab -= (dist - traveled);
         lastX = x; lastY = y; lastP = p;
+        // Moved less than a spacing but pressed harder (slow, heavy
+        // strokes; the pen settling at pen-down).
+        growInPlace(x, y, p);
     }
 };
 
