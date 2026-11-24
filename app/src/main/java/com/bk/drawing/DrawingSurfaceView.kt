@@ -1960,6 +1960,16 @@ class DrawingSurfaceView @JvmOverloads constructor(
                 xyp[curK + 2] = mapPressure(event.pressure)
 
                 // Predicted tail (if any). Recycled below in finally.
+                // Position is predicted; pressure is not allowed to
+                // exceed the latest real reading. The predictor
+                // extrapolates a rising pressure past where it ends up,
+                // and since predicted dabs are redrawn from real samples
+                // a batch later, an overshoot shows as the mark swelling
+                // and then jumping back — most visibly with the pen held
+                // still, where the in-place growth dabs follow pressure
+                // alone. Capped, a predicted dab can only be revised
+                // upward.
+                val pCap = xyp[curK + 2]
                 if (pe != null) {
                     try {
                         for (i in 0 until pe.historySize) {
@@ -1969,13 +1979,13 @@ class DrawingSurfaceView @JvmOverloads constructor(
                             val k = (realN + i) * 3
                             xyp[k]     = tmpDoc[0]
                             xyp[k + 1] = tmpDoc[1]
-                            xyp[k + 2] = mapPressure(pe.getHistoricalPressure(i))
+                            xyp[k + 2] = minOf(mapPressure(pe.getHistoricalPressure(i)), pCap)
                         }
                         viewToDoc(pe.x, pe.y, tmpDoc)
                         val k = (realN + pe.historySize) * 3
                         xyp[k]     = tmpDoc[0]
                         xyp[k + 1] = tmpDoc[1]
-                        xyp[k + 2] = mapPressure(pe.pressure)
+                        xyp[k + 2] = minOf(mapPressure(pe.pressure), pCap)
                     } finally {
                         pe.recycle()
                     }
