@@ -122,6 +122,7 @@ constexpr float kSpacing    = 0.18f;
 // Smallest radius increase (doc-px) that places an in-place growth dab;
 // see DabEmitter::growInPlace.
 constexpr float kGrowMinStep = 0.35f;
+constexpr float kGrowMaxStep = 0.6f;
 // Pressure → dab-radius range. kMinRadius = 0 lets the lightest pen
 // contact taper to nothing, so the brush has dynamic range across the
 // pen's full pressure curve. The bake/emit path floors spacing
@@ -2701,12 +2702,14 @@ struct DabEmitter {
     // jitter happened to carry it one spacing along — the stroke widened
     // in visible jumps. This places a dab at the pen whenever the radius
     // has grown past the last dab's by a step, travel or not. Growth
-    // only: easing off can't un-paint, here or with a real pen. The step
-    // is half the normal spacing fraction, so pressing in place lays
-    // dabs about as densely as drawing does.
+    // only: easing off can't un-paint, here or with a real pen.
     void growInPlace(float x, float y, float p) {
         float r = radiusOf(p);
-        float step = std::max(kGrowMinStep, 0.5f * kSpacing * lastDabR);
+        // Proportional for small dabs, but capped: 9% of a large radius
+        // is a couple of pixels, which read as visible jumps at the top
+        // of the pressure range.
+        float step = std::clamp(0.5f * kSpacing * lastDabR,
+                                kGrowMinStep, kGrowMaxStep);
         if (r < lastDabR + step) return;
         emit(x, y, r);
         lastDabR = r;
